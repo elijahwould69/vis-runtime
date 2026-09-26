@@ -235,7 +235,145 @@ async function addColumnIfMissing(
   }
 }
 
+
+async function bootstrapLegacySchema(env) {
+  // VIS_V16_LEGACY_BOOTSTRAP
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS agents (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      role TEXT NOT NULL,
+      parent_agent TEXT,
+      status TEXT DEFAULT 'active',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS rotations (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      completed_at TEXT,
+      status TEXT NOT NULL,
+      summary TEXT,
+      cost_usd REAL DEFAULT 0
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS research (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rotation_id TEXT,
+      agent_id TEXT NOT NULL,
+      finding TEXT NOT NULL,
+      evidence TEXT,
+      confidence REAL,
+      implication TEXT,
+      recommended_action TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS opportunities (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      origin TEXT,
+      stage TEXT,
+      demand_evidence TEXT,
+      pricing_evidence TEXT,
+      unit_economics TEXT,
+      automation_pct REAL,
+      owner_labor TEXT,
+      risks_dependencies TEXT,
+      next_test TEXT,
+      status TEXT,
+      last_updated TEXT DEFAULT CURRENT_TIMESTAMP,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS experiments (
+      id TEXT PRIMARY KEY,
+      opportunity_id TEXT,
+      hypothesis TEXT,
+      method TEXT,
+      max_approved_spend REAL DEFAULT 0,
+      actual_spend REAL DEFAULT 0,
+      result TEXT,
+      information_gained TEXT,
+      kill_criteria TEXT,
+      decision TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS handoffs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rotation_id TEXT,
+      from_agent TEXT NOT NULL,
+      to_agent TEXT NOT NULL,
+      request TEXT,
+      evidence_reference TEXT,
+      response TEXT,
+      status TEXT DEFAULT 'pending',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      response_resolution TEXT
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS decisions (
+      id TEXT PRIMARY KEY,
+      decision TEXT NOT NULL,
+      evidence TEXT,
+      owner_approval_required INTEGER DEFAULT 0,
+      approved_by TEXT,
+      effect TEXT,
+      notes TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS financial_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      category TEXT NOT NULL,
+      amount_usd REAL NOT NULL,
+      description TEXT,
+      approved INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS runtime_health (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      component TEXT NOT NULL,
+      status TEXT NOT NULL,
+      details TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+
+    `CREATE TABLE IF NOT EXISTS audit_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      actor TEXT NOT NULL,
+      action TEXT NOT NULL,
+      target TEXT,
+      result TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`
+  ];
+
+  for (const sql of statements) {
+    await env.DB.prepare(sql).run();
+  }
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_handoffs_rotation
+    ON handoffs(rotation_id)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_research_rotation
+    ON research(rotation_id)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_rotations_agent
+    ON rotations(agent_id)
+  `).run();
+}
+
 async function ensureSchema(env) {
+  await bootstrapLegacySchema(env);
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS execution_locks (
       lock_key TEXT PRIMARY KEY,
@@ -716,36 +854,85 @@ async function finishRotation(
    ============================================================ */
 
 async function fetchText(url) {
-  const controller =
-    new AbortController();
+  const maxAttempts = 3;
+  let lastError;
 
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      10000
-    );
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt++
+  ) {
+    const controller =
+      new AbortController();
 
-  try {
-    const response =
-      await fetch(url, {
-        headers: {
-          "User-Agent":
-            "VIS-Research-Network/1.6"
-        },
-        signal: controller.signal
-      });
-
-    if (!response.ok) {
-      throw new Error(
-        `HTTP ${response.status}: ${url}`
+    const timeout =
+      setTimeout(
+        () => controller.abort(),
+        12000
       );
+
+    try {
+      const response =
+        await fetch(url, {
+          headers: {
+            "User-Agent":
+              "VIS-Research-Network/1.6"
+          },
+          signal: controller.signal
+        });
+
+      if (!response.ok) {
+        const error =
+          new Error(
+            `HTTP ${response.status}: ${url}`
+          );
+
+        error.status =
+          response.status;
+
+        throw error;
+      }
+
+      return await response.text();
+
+    } catch (error) {
+      lastError = error;
+
+      const status =
+        Number(error?.status || 0);
+
+      const transient =
+        error?.name === "AbortError" ||
+        status === 408 ||
+        status === 425 ||
+        status === 429 ||
+        status >= 500 ||
+        status === 0;
+
+      if (
+        !transient ||
+        attempt === maxAttempts
+      ) {
+        throw error;
+      }
+
+      await new Promise(
+        resolve =>
+          setTimeout(
+            resolve,
+            500 * attempt
+          )
+      );
+
+    } finally {
+      clearTimeout(timeout);
     }
-
-    return await response.text();
-
-  } finally {
-    clearTimeout(timeout);
   }
+
+  throw lastError ||
+    new Error(
+      `Sensor fetch failed: ${url}`
+    );
 }
 
 async function fetchJSON(url) {
@@ -1009,6 +1196,17 @@ async function runSensors(env, rid) {
         fetched: result.fetched,
         newItems: result.added
       });
+
+      try {
+        await env.DB.prepare(`
+          UPDATE failures
+          SET resolved = 1
+          WHERE resolved = 0
+            AND component = ?
+        `).bind(
+          `sensor:${sensor.id}`
+        ).run();
+      } catch (_) {}
 
     } catch (error) {
       report.push({
@@ -1903,14 +2101,7 @@ falsification test.
     );
 
     stage =
-      "resolve-old-failures";
-
-    await env.DB.prepare(`
-      UPDATE failures
-      SET resolved = 1
-      WHERE resolved = 0
-        AND rotation_id != ?
-    `).bind(rid).run();
+      "health-finalized";
 
     return {
       ok: true,

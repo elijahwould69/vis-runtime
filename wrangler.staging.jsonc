@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vis-runtime-staging",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-25",
+  "workers_dev": true,
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "vis-institutional-memory-staging",
+      "database_id": "18ce2dca-61ca-4b36-b315-509987fd8743"
+    }
+  ],
+
+  "ai": {
+    "binding": "AI"
+  },
+
+  "triggers": {
+    "crons": []
+  }
+}
