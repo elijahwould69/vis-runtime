@@ -9,3 +9,4 @@ and orchestration system.
 Production deployment is managed through Cloudflare Workers.
 
 Do not store credentials or secrets in this repository.
+Production baseline: VIS Runtime v1.5.0
