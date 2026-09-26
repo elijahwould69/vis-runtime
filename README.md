@@ -1,12 +1,44 @@
 # VIS Runtime
 
-Venture Intelligence System runtime.
+Venture Intelligence System autonomous runtime.
 
-Production infrastructure for the VIS autonomous research,
-opportunity discovery, diligence, institutional-memory,
-and orchestration system.
+Production branch: `main`
+Development branch: `develop`
 
-Production deployment is managed through Cloudflare Workers.
+## VIS V1.6
 
-Do not store credentials or secrets in this repository.
-Production baseline: VIS Runtime v1.5.0
+Runtime architecture:
+
+Sensors -> Scout -> Atlas -> Vector -> D1 -> Slack
+
+Operating loop:
+
+Run -> Observe -> Diagnose -> Repair -> Verify -> Document -> Continue
+
+V1.6 engineering goals:
+
+- controlled development
+- automated validation
+- migration discipline
+- staging
+- deployment verification
+- rollback capability
+- progressive modularization
+
+## Financial Safeguard
+
+Autonomous external spend limit: $0 USD.
+
+Paid spending must not be enabled without explicit Founder authorization.
+
+## Security
+
+Credentials and secrets must never be committed to this repository.
+
+Runtime secrets remain in Cloudflare.
+
+## Deployment
+
+`main` is production.
+
+Development and testing occur on `develop` before promotion.

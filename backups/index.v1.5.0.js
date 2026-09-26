@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.6.0",
+  version: "1.5.0",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -730,7 +730,7 @@ async function fetchText(url) {
       await fetch(url, {
         headers: {
           "User-Agent":
-            "VIS-Research-Network/1.6"
+            "VIS-Research-Network/1.5"
         },
         signal: controller.signal
       });
@@ -1888,7 +1888,7 @@ falsification test.
       env,
       "vis-runtime",
       "healthy",
-      `V1.6 complete ${rid}; new=${newItems.length}; shortlisted=${selected.length}`
+      `V1.5 complete ${rid}; new=${newItems.length}; shortlisted=${selected.length}`
     );
 
     stage =
