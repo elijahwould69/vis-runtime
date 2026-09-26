@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.6.0",
+  version: "1.7.3-development",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -549,6 +549,115 @@ async function ensureSchema(env) {
     "evidence",
     "TEXT"
   );
+
+  // VIS V1.7 — Hive organization, constrained workers and execution state.
+  const v17Statements = [
+    `CREATE TABLE IF NOT EXISTS departments (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, head_agent TEXT NOT NULL,
+      mandate TEXT, status TEXT DEFAULT 'active', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS worker_jobs (
+      id TEXT PRIMARY KEY, rotation_id TEXT, department_id TEXT, manager_agent TEXT,
+      worker_role TEXT NOT NULL, mandate TEXT NOT NULL, knowledge_packet_id TEXT,
+      authority_scope TEXT DEFAULT 'internal-zero-dollar', status TEXT DEFAULT 'queued',
+      result TEXT, attempts INTEGER DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      started_at TEXT, completed_at TEXT, last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS knowledge_packets (
+      id TEXT PRIMARY KEY, rotation_id TEXT, department_id TEXT, packet_type TEXT NOT NULL,
+      content TEXT NOT NULL, provenance TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS quality_evaluations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, rotation_id TEXT, subject_type TEXT NOT NULL,
+      subject_id TEXT, evaluator TEXT NOT NULL, passed INTEGER NOT NULL, flags TEXT,
+      notes TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS founder_signals (
+      id TEXT PRIMARY KEY, source TEXT NOT NULL, source_ref TEXT, signal_type TEXT NOT NULL,
+      content TEXT, priority INTEGER DEFAULT 1, status TEXT DEFAULT 'new',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP, processed_at TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS experiment_queue (
+      id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL UNIQUE, opportunity_id TEXT,
+      authority_scope TEXT DEFAULT 'internal-zero-dollar', status TEXT DEFAULT 'queued',
+      assigned_to TEXT, attempts INTEGER DEFAULT 0, queued_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      started_at TEXT, completed_at TEXT, last_updated TEXT DEFAULT CURRENT_TIMESTAMP,
+      diagnostic TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS experiment_evidence (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, experiment_id TEXT NOT NULL, queue_id TEXT,
+      evidence_type TEXT NOT NULL, source_ref TEXT, evidence_text TEXT NOT NULL,
+      verification_status TEXT DEFAULT 'internal-analysis', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS experiment_reviews (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, experiment_id TEXT NOT NULL, queue_id TEXT,
+      reviewer TEXT NOT NULL, decision TEXT NOT NULL, review TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS experiment_provenance (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      experiment_id TEXT NOT NULL,
+      queue_id TEXT,
+      rotation_id TEXT,
+      phase TEXT NOT NULL,
+      provenance TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS acceptance_telemetry (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      rotation_id TEXT NOT NULL,
+      experiment_id TEXT,
+      atlas_quality_passed INTEGER DEFAULT 0,
+      vector_quality_passed INTEGER DEFAULT 0,
+      experiment_executed INTEGER DEFAULT 0,
+      experiment_status TEXT,
+      experiment_decision TEXT,
+      slack_synchronized INTEGER DEFAULT 0,
+      external_spend_usd REAL DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`
+  ];
+
+  for (const sql of v17Statements) {
+    await env.DB.prepare(sql).run();
+  }
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_worker_jobs_status ON worker_jobs(status)
+  `).run();
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_experiment_queue_status ON experiment_queue(status)
+  `).run();
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_experiment_evidence_experiment ON experiment_evidence(experiment_id)
+  `).run();
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_experiment_reviews_experiment ON experiment_reviews(experiment_id)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_experiment_provenance_experiment
+    ON experiment_provenance(experiment_id)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_acceptance_telemetry_rotation
+    ON acceptance_telemetry(rotation_id)
+  `).run();
+
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO departments (id, name, head_agent, mandate)
+    VALUES
+      ('DISCOVERY', 'Discovery', 'ATLAS', 'Broad opportunity discovery and synthesis'),
+      ('DILIGENCE', 'Diligence', 'VECTOR', 'Independent commercial challenge and falsification')
+  `).run();
+
+  await addColumnIfMissing(env, "experiments", "status", "TEXT DEFAULT 'draft'");
+  await addColumnIfMissing(env, "experiments", "approved_by", "TEXT");
+  await addColumnIfMissing(env, "experiments", "approved_at", "TEXT");
+  await addColumnIfMissing(env, "experiments", "started_at", "TEXT");
+  await addColumnIfMissing(env, "experiments", "completed_at", "TEXT");
+  await addColumnIfMissing(env, "experiments", "last_updated", "TEXT");
 }
 
 /* ============================================================
@@ -1267,69 +1376,27 @@ async function getNewSensorItems(
    ============================================================ */
 
 const SCOUT_SYSTEM = `
-You are SCOUT, the research triage layer inside
-the Venture Intelligence System.
+You are SCOUT, the evidence-triage layer inside VIS.
 
-You do NOT invent business ideas.
+Do not invent businesses. Select external signals that deserve deeper investigation.
+Optimize for verified economic intelligence per dollar and per owner-minute.
 
-You inspect newly retrieved external signals and
-decide which deserve attention from Atlas.
+Judge economic relevance, novelty, monetization potential, automation potential,
+evidence strength and urgency. Separate FACT, INTERPRETATION and HYPOTHESIS.
+A headline, popularity or technology novelty is not customer demand.
 
-The founder does not want activity for activity's
-sake.
+DIVERSITY MANDATE:
+Search across economic activity, not merely familiar AI/cyber themes. Treat physical
+products, boring B2B services, manufacturing, construction, logistics, healthcare,
+agriculture, energy, finance, education, procurement, licensing, distribution,
+import/export and niche markets as first-class territory. Unfamiliarity is not a
+rejection reason. When several signals are similarly strong, prefer a shortlist that
+expands industry coverage. Do not suppress a technology signal when its evidence is
+materially stronger. It is acceptable to select nothing.
 
-Your objective is:
-
-VERIFIED ECONOMIC INTELLIGENCE PER DOLLAR
-AND PER OWNER-MINUTE.
-
-Evaluate the evidence across these dimensions:
-
-ECONOMIC RELEVANCE
-Does this potentially affect customers,
-businesses, costs, regulation, labour,
-technology, supply, demand or market structure?
-
-NOVELTY
-Is this meaningfully new or merely routine?
-
-MONETIZATION POTENTIAL
-Could the underlying change create a pain point,
-service opportunity, product opportunity,
-information advantage or operational need?
-
-AUTOMATION POTENTIAL
-Could AI/software/process automation potentially
-capture part of the opportunity?
-
-EVIDENCE STRENGTH
-First-party statistical/government evidence is
-stronger than discussion-board activity.
-
-URGENCY
-Would delay materially reduce the value of
-investigating it?
-
-You must distinguish:
-
-FACT OBSERVED IN SOURCE
-INTERPRETATION
-HYPOTHESIS
-
-Do not claim that a headline proves customer
-demand.
-
-Do not force a signal to pass.
-
-It is acceptable to select nothing.
-
-Return concise analysis followed by:
-
-SHORTLIST:
-IDs only, comma separated.
-
-If none qualify:
-SHORTLIST: NONE
+Return concise analysis followed by exactly:
+SHORTLIST: IDs only, comma separated
+Or: SHORTLIST: NONE
 `;
 
 async function scoutSignals(
@@ -1529,74 +1596,36 @@ async function getContext(env) {
    ============================================================ */
 
 const ATLAS_SYSTEM = `
-You are ATLAS, Think Tank Manager inside VIS.
+You are ATLAS, Discovery Department Head inside VIS.
 
-SCOUT has already filtered the raw research
-network.
+Think aggressively, laterally and across industries. Unfamiliarity is a learning
+requirement, not a rejection criterion. Do not anchor to the founder's existing work.
+Maintain strict factual integrity and never manufacture demand.
 
-Your job is divergent opportunity discovery.
+Every discovery must expose this traceable chain:
+SIGNAL -> CUSTOMER PAIN -> OPPORTUNITY -> EVIDENCE -> FALSIFIABLE ASSUMPTION -> TEST.
+Label verified observations, institutional memory, reasoned hypotheses and unverified
+assumptions. If a link is unsupported, say so. Killed ideas require materially new
+evidence before revival. You may conclude NO HIGH-CONFIDENCE OPPORTUNITY FOUND.
 
-Do not anchor yourself to flooring, contracting,
-the founder's existing work, or any single
-industry.
-
-Think laterally.
-
-A signal may create an opportunity in an entirely
-different industry.
-
-Maintain strict factual integrity.
-
-Distinguish:
-
-VERIFIED EXTERNAL OBSERVATION
-INSTITUTIONAL MEMORY
-REASONED HYPOTHESIS
-UNVERIFIED ASSUMPTION
-
-A news release does not automatically prove
-customer demand.
-
-You are allowed to conclude:
-
-NO HIGH-CONFIDENCE OPPORTUNITY FOUND.
-
-You cannot spend money.
-
-You cannot contact prospects, publish publicly,
-open consequential accounts, sign contracts,
-make payments, impersonate the founder, or make
-legal, financial or compliance representations.
+You cannot spend money or take consequential external actions.
 
 Return:
-
 DISCOVERY
-
-SIGNALS USED
-(include URLs)
-
+SIGNALS USED (include URLs)
+SIGNAL -> PAIN -> OPPORTUNITY CHAIN
 WHAT IS ACTUALLY KNOWN
-
 CROSS-INDUSTRY INSIGHT
-
 TARGET CUSTOMER
-
 CUSTOMER PAIN
-
 BUSINESS MODEL
-
 WHY NOW
-
 AUTOMATION POTENTIAL
-
 REVENUE LOGIC
-
 MAJOR RISKS
-
 UNVERIFIED ASSUMPTIONS
-
+FALSIFIABLE ASSUMPTION
 ZERO-DOLLAR VALIDATION TEST
-
 VECTOR HANDOFF
 `;
 
@@ -1605,79 +1634,697 @@ VECTOR HANDOFF
    ============================================================ */
 
 const VECTOR_SYSTEM = `
-You are VECTOR, Opportunity Pipeline Manager
-inside VIS.
+You are VECTOR, Diligence Department Head inside VIS.
 
-You independently evaluate Atlas.
+CONTEXT ISOLATION RULE: evaluate only the current rotation packet supplied to you.
+Do not import, recall or substitute prior opportunities, examples or templates. If a
+concept is not present in the current Atlas memorandum or current evidence packet, it
+must not appear in your assessment.
 
-Do not reward creativity unless commercial logic
-survives scrutiny.
+Independently challenge demand, pain, competition, pricing, unit economics, capital,
+time to revenue, automation, owner labour, scalability, defensibility, dependencies,
+failure modes and evidence quality. Classify important claims SUPPORTED, PARTIALLY
+SUPPORTED or UNSUPPORTED. Popularity is not demand. Never manufacture evidence.
 
-Evaluate:
-
-DEMAND
-CUSTOMER PAIN
-COMPETITION
-PRICING
-UNIT ECONOMICS
-STARTUP CAPITAL
-TIME TO REVENUE
-AUTOMATION
-OWNER LABOUR
-SCALABILITY
-DEFENSIBILITY
-DEPENDENCIES
-FAILURE MODES
-EVIDENCE QUALITY
-
-Classify important claims as:
-
-SUPPORTED
-PARTIALLY SUPPORTED
-UNSUPPORTED
-
-Never manufacture evidence.
-
-Popularity is not demand.
-
-A government release is evidence of the facts in
-the release, not proof that somebody will buy a
-proposed product.
-
-You cannot spend money or perform consequential
-external actions.
+You cannot spend money or take consequential external actions.
 
 Return:
-
 HYPOTHESIS
-
 EVIDENCE QUALITY
-
+TRACEABILITY CHECK
 WHAT HOLDS UP
-
 WHAT DOES NOT
-
 DEMAND ASSESSMENT
-
 ECONOMIC LOGIC
-
 AUTOMATION ASSESSMENT
-
 OWNER-LABOUR ASSESSMENT
-
 KEY DEPENDENCIES
-
 UNVERIFIED ASSUMPTIONS
-
 FASTEST ZERO-DOLLAR FALSIFICATION TEST
-
-DECISION:
-ADVANCE / HOLD / KILL
-
+DECISION: ADVANCE / HOLD / KILL
 REASON
-
 ATLAS FEEDBACK
 `;
+
+/* ============================================================
+   V1.7 QUALITY + EXECUTION CONTROL
+   ============================================================ */
+
+function normalizeWords(text) {
+  return new Set(
+    String(text || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, " ")
+      .split(/\s+/)
+      .filter(word => word.length >= 5)
+  );
+}
+
+function overlapRatio(a, b) {
+  const left = normalizeWords(a);
+  const right = normalizeWords(b);
+  if (!left.size || !right.size) return 0;
+  let overlap = 0;
+  for (const word of left) if (right.has(word)) overlap++;
+  return overlap / Math.min(left.size, right.size);
+}
+
+async function evaluateReasoningQuality(env, rid, subjectType, subjectId, output, currentPacket) {
+  const flags = [];
+  const required = subjectType === "ATLAS"
+    ? ["CUSTOMER PAIN", "FALSIFIABLE ASSUMPTION", "ZERO-DOLLAR VALIDATION TEST"]
+    : ["TRACEABILITY CHECK", "EVIDENCE QUALITY", "DECISION:"];
+
+  for (const heading of required) {
+    if (!String(output).toUpperCase().includes(heading)) flags.push(`missing:${heading}`);
+  }
+
+  if (subjectType === "VECTOR") {
+    const recent = await env.DB.prepare(`
+      SELECT finding FROM research
+      WHERE agent_id = 'VECTOR' AND rotation_id != ?
+      ORDER BY rowid DESC LIMIT 3
+    `).bind(`${rid}-VECTOR`).all();
+    const maxOverlap = Math.max(0, ...(recent.results || []).map(row => overlapRatio(output, row.finding)));
+    if (maxOverlap > 0.72) flags.push(`possible-stale-repetition:${maxOverlap.toFixed(2)}`);
+    if (!currentPacket.length && !/HOLD|KILL|NO HIGH-CONFIDENCE/i.test(output)) {
+      flags.push("assertive-without-current-evidence");
+    }
+  }
+
+  const passed = flags.length === 0;
+  await env.DB.prepare(`
+    INSERT INTO quality_evaluations
+      (rotation_id, subject_type, subject_id, evaluator, passed, flags, notes)
+    VALUES (?, ?, ?, 'VIS_QA', ?, ?, ?)
+  `).bind(
+    rid, subjectType, subjectId, passed ? 1 : 0,
+    JSON.stringify(flags), passed ? "Quality gate passed." : "Output retained for audit but flagged for review."
+  ).run();
+
+  return { passed, flags };
+}
+
+async function quarantineReasoning(env, rid, subjectType, subjectId, output, quality) {
+  const packetId = `QUARANTINE-${subjectId}-${Date.now()}`;
+  await env.DB.prepare(`
+    INSERT INTO knowledge_packets
+      (id, rotation_id, department_id, packet_type, content, provenance)
+    VALUES (?, ?, ?, 'reasoning-quarantine', ?, ?)
+  `).bind(
+    packetId,
+    rid,
+    subjectType === "ATLAS" ? "DISCOVERY" : "DILIGENCE",
+    cleanText(output, 12000),
+    JSON.stringify({ subjectType, subjectId, flags: quality?.flags || [] })
+  ).run();
+  await audit(env, "VIS_QA", "REASONING_QUARANTINED", subjectId, JSON.stringify(quality?.flags || []));
+  return packetId;
+}
+
+
+function deterministicStructureRepair(subjectType, output, quality) {
+  let repaired = String(output || "").trim();
+  const flags = Array.isArray(quality?.flags) ? quality.flags : [];
+
+  const missing = flags
+    .filter(flag => String(flag).startsWith("missing:"))
+    .map(flag => String(flag).slice("missing:".length));
+
+  if (!missing.length) {
+    return repaired;
+  }
+
+  const fallback = {
+    "CUSTOMER PAIN":
+      "CUSTOMER PAIN\nInsufficient verified evidence to strengthen this section beyond the current memorandum.",
+    "FALSIFIABLE ASSUMPTION":
+      "FALSIFIABLE ASSUMPTION\nThe opportunity should not advance unless the stated customer pain and economic value can be verified with current evidence or a permitted zero-dollar test.",
+    "ZERO-DOLLAR VALIDATION TEST":
+      "ZERO-DOLLAR VALIDATION TEST\nUse only existing public or internal evidence to test the weakest material assumption. Do not contact prospects, spend money, create accounts, publish externally, or manufacture evidence. If the available evidence cannot test the assumption, record the test as blocked.",
+    "TRACEABILITY CHECK":
+      "TRACEABILITY CHECK\nNo claim should be treated as supported unless it is traceable to the current Atlas memorandum or current evidence packet.",
+    "EVIDENCE QUALITY":
+      "EVIDENCE QUALITY\nEvidence is limited to the current packet; unsupported claims remain unsupported.",
+    "DECISION:":
+      "DECISION: HOLD\nInsufficient current evidence for advancement."
+  };
+
+  for (const heading of missing) {
+    const section = fallback[heading];
+    if (section && !repaired.toUpperCase().includes(heading)) {
+      repaired += `\n\n${section}`;
+    }
+  }
+
+  return repaired;
+}
+
+async function selfRepairReasoning(env, rid, subjectType, subjectId, output, currentPacket, repairContext = "") {
+  const maxRepairAttempts = 2;
+  let candidate = output;
+  let quality = await evaluateReasoningQuality(env, rid, subjectType, subjectId, candidate, currentPacket);
+
+  for (let attempt = 1; !quality.passed && attempt <= maxRepairAttempts; attempt++) {
+    const repairSystem = `
+You are VIS REASONING REPAIR, a constrained internal quality worker.
+Repair the supplied ${subjectType} output only. Do not invent evidence, customers, prices, demand, prior context or external facts.
+Preserve useful reasoning, remove stale/template leakage, and correct only the QA failures listed.
+Use only the supplied current packet and repair context. If evidence is insufficient, explicitly say so and choose a conservative HOLD/KILL or NO HIGH-CONFIDENCE OPPORTUNITY result as appropriate.
+Return the complete corrected ${subjectType} memorandum, not commentary about the repair.
+`;
+
+    candidate = await think(
+      env,
+      repairSystem,
+      `
+ROTATION: ${rid}
+SUBJECT: ${subjectType}
+REPAIR ATTEMPT: ${attempt}/${maxRepairAttempts}
+QA FLAGS: ${JSON.stringify(quality.flags)}
+
+CURRENT PACKET:
+${JSON.stringify(currentPacket, null, 2)}
+
+REPAIR CONTEXT:
+${cleanText(repairContext, 9000)}
+
+OUTPUT TO REPAIR:
+${cleanText(candidate, 12000)}
+`,
+      1200,
+      0.15
+    );
+
+    await audit(env, "VIS_QA", "REASONING_REPAIR_ATTEMPT", subjectId, `attempt=${attempt}; flags=${JSON.stringify(quality.flags)}`);
+    quality = await evaluateReasoningQuality(env, rid, subjectType, subjectId, candidate, currentPacket);
+  }
+
+  if (!quality.passed) {
+    const deterministicCandidate =
+      deterministicStructureRepair(
+        subjectType,
+        candidate,
+        quality
+      );
+
+    if (deterministicCandidate !== candidate) {
+      await audit(
+        env,
+        "VIS_QA",
+        "DETERMINISTIC_STRUCTURE_REPAIR",
+        subjectId,
+        JSON.stringify(quality.flags || [])
+      );
+
+      candidate = deterministicCandidate;
+
+      quality =
+        await evaluateReasoningQuality(
+          env,
+          rid,
+          subjectType,
+          subjectId,
+          candidate,
+          currentPacket
+        );
+    }
+  }
+
+  if (!quality.passed) {
+    const quarantineId =
+      await quarantineReasoning(
+        env,
+        rid,
+        subjectType,
+        subjectId,
+        candidate,
+        quality
+      );
+
+    return {
+      output: candidate,
+      quality,
+      repaired: true,
+      accepted: false,
+      quarantineId
+    };
+  }
+
+  return {
+    output: candidate,
+    quality,
+    repaired: candidate !== output,
+    accepted: true,
+    quarantineId: null
+  };
+}
+
+
+async function recoverStaleRuntimeState(env) {
+  await ensureSchema(env);
+
+  const staleRotations =
+    await env.DB.prepare(`
+      UPDATE rotations
+      SET
+        status = 'failed',
+        completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+        summary = COALESCE(
+          summary,
+          'V1.7.2 recovery marked abandoned running rotation as failed.'
+        )
+      WHERE status = 'running'
+        AND datetime(started_at) <
+            datetime('now', '-15 minutes')
+    `).run();
+
+  const staleLocks =
+    await env.DB.prepare(`
+      DELETE FROM execution_locks
+      WHERE datetime(created_at) <
+            datetime('now', '-15 minutes')
+    `).run();
+
+  await watchdogExperiments(env);
+
+  await audit(
+    env,
+    "VIS_RUNTIME",
+    "STALE_STATE_RECOVERY",
+    "runtime",
+    JSON.stringify({
+      rotationsChanged:
+        staleRotations.meta?.changes || 0,
+      locksRemoved:
+        staleLocks.meta?.changes || 0
+    })
+  );
+
+  return {
+    ok: true,
+    version: VIS.version,
+    staleRotationsRecovered:
+      staleRotations.meta?.changes || 0,
+    staleLocksRemoved:
+      staleLocks.meta?.changes || 0,
+    experimentWatchdogRun: true,
+    externalSpendUSD: 0
+  };
+}
+
+async function synchronizeApprovedExperiments(env) {
+  // Queue only explicitly approved, zero-dollar experiments. Never infer approval.
+  const approved = await env.DB.prepare(`
+    SELECT id, opportunity_id
+    FROM experiments
+    WHERE COALESCE(max_approved_spend, 0) = 0
+      AND LOWER(COALESCE(status, '')) NOT IN ('completed', 'killed')
+      AND (
+        LOWER(COALESCE(status, '')) = 'approved'
+        OR LOWER(COALESCE(decision, '')) = 'approved'
+        OR (
+          approved_at IS NOT NULL
+          AND LOWER(COALESCE(status, '')) NOT IN
+            ('completed', 'blocked', 'failed', 'killed')
+        )
+      )
+  `).all();
+
+  for (const experiment of approved.results || []) {
+    await env.DB.prepare(`
+      INSERT OR IGNORE INTO experiment_queue
+        (id, experiment_id, opportunity_id, status, assigned_to)
+      VALUES (?, ?, ?, 'queued', 'EXPERIMENT_WORKER')
+    `).bind(`QUEUE-${experiment.id}`, experiment.id, experiment.opportunity_id || null).run();
+  }
+}
+
+async function watchdogExperiments(env) {
+  // Requeue stale internal work. No spending or external action is authorized here.
+  await env.DB.prepare(`
+    UPDATE experiment_queue
+    SET status = 'queued',
+        attempts = attempts + 1,
+        diagnostic = 'Watchdog requeued stale internal work',
+        last_updated = CURRENT_TIMESTAMP
+    WHERE status IN ('assigned', 'running')
+      AND attempts < 3
+      AND datetime(COALESCE(started_at, queued_at)) < datetime('now', '-2 hours')
+  `).run();
+
+  await env.DB.prepare(`
+    UPDATE experiment_queue
+    SET status = 'quarantined',
+        diagnostic = 'Watchdog quarantined work after retry ceiling',
+        completed_at = CURRENT_TIMESTAMP,
+        last_updated = CURRENT_TIMESTAMP
+    WHERE status IN ('assigned', 'running')
+      AND attempts >= 3
+      AND datetime(COALESCE(started_at, queued_at)) < datetime('now', '-2 hours')
+  `).run();
+}
+
+const EXPERIMENT_WORKER_SYSTEM = `
+You are EXPERIMENT_WORKER inside VIS. Execute only bounded, internal, zero-dollar analytical work.
+You may analyze the supplied experiment, existing VIS evidence and institutional memory. You may not
+contact people, create accounts, publish, buy anything, claim legal/compliance certification, or invent
+external evidence. Distinguish OBSERVATION, INFERENCE and UNKNOWN. If the requested method requires
+external action or evidence not present, mark it BLOCKED rather than pretending it was executed.
+
+Return exactly these headings:
+EXECUTION STATUS: COMPLETED / BLOCKED / FAILED
+HYPOTHESIS TESTED
+METHOD ACTUALLY EXECUTED
+EVIDENCE USED
+OBSERVATIONS
+INFERENCES
+UNKNOWNS
+RESULT
+INFORMATION GAINED
+KILL-CRITERIA CHECK
+NEXT ZERO-DOLLAR STEP
+EXTERNAL ACTION REQUIRED: YES / NO
+`;
+
+const EXPERIMENT_VECTOR_SYSTEM = `
+You are VECTOR reviewing a completed VIS experiment. Use only the experiment record, execution output,
+and evidence packet supplied. Do not import prior opportunities or invent evidence. Determine what the
+experiment actually established, what remains unknown, and whether the opportunity should ADVANCE,
+ITERATE, HOLD, KILL, or ESCALATE. ESCALATE only when a useful next step requires Founder authority.
+
+Return exactly:
+TRACEABILITY CHECK
+EVIDENCE QUALITY
+WHAT THE EXPERIMENT ESTABLISHED
+WHAT IT DID NOT ESTABLISH
+ECONOMIC IMPLICATION
+RISK / DEPENDENCY UPDATE
+DECISION: ADVANCE / ITERATE / HOLD / KILL / ESCALATE
+REASON
+NEXT STEP
+FOUNDER ACTION REQUIRED: YES / NO
+`;
+
+async function loadExperimentEvidencePacket(env, experiment) {
+  const evidence = await env.DB.prepare(`
+    SELECT source_name, item_url, title, evidence_text, verification_status, retrieved_at
+    FROM evidence
+    ORDER BY id DESC
+    LIMIT 12
+  `).all();
+
+  const research = await env.DB.prepare(`
+    SELECT agent_id, finding, evidence, implication, recommended_action, created_at
+    FROM research
+    ORDER BY rowid DESC
+    LIMIT 8
+  `).all();
+
+  const opportunity = experiment.opportunity_id
+    ? await env.DB.prepare(`
+        SELECT id, name, stage, demand_evidence, pricing_evidence, unit_economics,
+               automation_pct, owner_labor, risks_dependencies, next_test, status
+        FROM opportunities WHERE id = ? LIMIT 1
+      `).bind(experiment.opportunity_id).first()
+    : null;
+
+  return {
+    opportunity: opportunity || null,
+    evidence: evidence.results || [],
+    recentResearch: research.results || []
+  };
+}
+
+function parseExperimentStatus(output) {
+  const match = String(output || '').match(/EXECUTION STATUS:\s*(COMPLETED|BLOCKED|FAILED)/i);
+  return match ? match[1].toUpperCase() : 'FAILED';
+}
+
+function parseExperimentDecision(output) {
+  const match = String(output || '').match(/DECISION:\s*(ADVANCE|ITERATE|HOLD|KILL|ESCALATE)/i);
+  return match ? match[1].toUpperCase() : 'HOLD';
+}
+
+async function executeNextApprovedExperiment(env, parentRid) {
+  const completedGuard = await env.DB.prepare(`
+    SELECT q.id AS queue_id, q.experiment_id
+    FROM experiment_queue q
+    JOIN experiments e ON e.id = q.experiment_id
+    WHERE q.status = 'queued'
+      AND (
+        LOWER(COALESCE(e.status, '')) = 'completed'
+        OR EXISTS (
+          SELECT 1
+          FROM experiment_evidence ee
+          WHERE ee.experiment_id = q.experiment_id
+            AND ee.evidence_type = 'worker-execution'
+            AND ee.verification_status = 'internally-executed'
+        )
+      )
+    ORDER BY q.queued_at ASC
+    LIMIT 1
+  `).first();
+
+  if (completedGuard) {
+    await env.DB.prepare(`
+      UPDATE experiment_queue
+      SET status = 'completed',
+          completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
+          last_updated = CURRENT_TIMESTAMP,
+          diagnostic = 'V1.7.3 idempotency guard prevented duplicate execution'
+      WHERE id = ?
+    `).bind(completedGuard.queue_id).run();
+
+    await audit(
+      env,
+      'VIS_RUNTIME',
+      'EXPERIMENT_DUPLICATE_PREVENTED',
+      completedGuard.experiment_id,
+      'Previously completed experiment was not re-executed.'
+    );
+  }
+
+  const queue = await env.DB.prepare(`
+    SELECT q.id AS queue_id, q.experiment_id, q.opportunity_id, q.attempts,
+           e.hypothesis, e.method, e.kill_criteria, e.max_approved_spend,
+           e.actual_spend, e.status AS experiment_status, e.decision AS experiment_decision
+    FROM experiment_queue q
+    JOIN experiments e ON e.id = q.experiment_id
+    WHERE q.status = 'queued'
+      AND q.authority_scope = 'internal-zero-dollar'
+      AND COALESCE(e.max_approved_spend, 0) = 0
+      AND COALESCE(e.actual_spend, 0) = 0
+    ORDER BY q.queued_at ASC
+    LIMIT 1
+  `).first();
+
+  if (!queue) return { executed: false, reason: 'No approved zero-dollar experiment queued.' };
+
+  const workerRid = `${parentRid}-EXP-${queue.experiment_id}`;
+  await createRotation(env, workerRid, 'EXPERIMENT_WORKER');
+
+  await env.DB.prepare(`
+    UPDATE experiment_queue
+    SET status = 'running', assigned_to = 'EXPERIMENT_WORKER', attempts = attempts + 1,
+        started_at = COALESCE(started_at, CURRENT_TIMESTAMP), last_updated = CURRENT_TIMESTAMP,
+        diagnostic = 'Execution worker started'
+    WHERE id = ?
+  `).bind(queue.queue_id).run();
+
+  await env.DB.prepare(`
+    UPDATE experiments
+    SET status = 'running', started_at = COALESCE(started_at, CURRENT_TIMESTAMP),
+        last_updated = CURRENT_TIMESTAMP
+    WHERE id = ?
+  `).bind(queue.experiment_id).run();
+
+  try {
+    const packet = await loadExperimentEvidencePacket(env, queue);
+
+    await env.DB.prepare(`
+      INSERT INTO experiment_provenance
+        (experiment_id, queue_id, rotation_id, phase, provenance)
+      VALUES (?, ?, ?, 'worker-input', ?)
+    `).bind(
+      queue.experiment_id,
+      queue.queue_id,
+      workerRid,
+      cleanText(JSON.stringify({
+        hypothesis: queue.hypothesis,
+        method: queue.method,
+        kill_criteria: queue.kill_criteria,
+        authority_scope: 'internal-zero-dollar',
+        max_approved_spend: 0,
+        actual_spend: 0,
+        evidence_packet: packet
+      }), 30000)
+    ).run();
+
+    const output = await think(env, EXPERIMENT_WORKER_SYSTEM, `
+PARENT ROTATION: ${parentRid}
+EXPERIMENT ID: ${queue.experiment_id}
+OPPORTUNITY ID: ${queue.opportunity_id || 'NONE'}
+HYPOTHESIS: ${queue.hypothesis || 'UNSPECIFIED'}
+REQUESTED METHOD: ${queue.method || 'UNSPECIFIED'}
+KILL CRITERIA: ${queue.kill_criteria || 'UNSPECIFIED'}
+MAX APPROVED SPEND: $0
+ACTUAL SPEND: $0
+
+AVAILABLE INTERNAL EVIDENCE PACKET:
+${JSON.stringify(packet, null, 2)}
+`, 1300, 0.15);
+
+    const executionStatus = parseExperimentStatus(output);
+    const finalQueueStatus = executionStatus === 'COMPLETED' ? 'completed'
+      : executionStatus === 'BLOCKED' ? 'blocked' : 'failed';
+
+    await env.DB.prepare(`
+      INSERT INTO experiment_evidence
+        (experiment_id, queue_id, evidence_type, source_ref, evidence_text, verification_status)
+      VALUES (?, ?, 'worker-execution', ?, ?, ?)
+    `).bind(
+      queue.experiment_id, queue.queue_id, workerRid, cleanText(output, 12000),
+      executionStatus === 'COMPLETED' ? 'internally-executed' : 'bounded-no-fabrication'
+    ).run();
+
+    await env.DB.prepare(`
+      INSERT INTO experiment_provenance
+        (experiment_id, queue_id, rotation_id, phase, provenance)
+      VALUES (?, ?, ?, 'worker-output', ?)
+    `).bind(
+      queue.experiment_id,
+      queue.queue_id,
+      workerRid,
+      cleanText(output, 30000)
+    ).run();
+
+    let reviewOutput = '';
+    let decision = executionStatus === 'FAILED' ? 'HOLD' : null;
+
+    if (executionStatus !== 'FAILED') {
+      reviewOutput = await think(env, EXPERIMENT_VECTOR_SYSTEM, `
+EXPERIMENT:
+${JSON.stringify({
+  id: queue.experiment_id,
+  opportunity_id: queue.opportunity_id,
+  hypothesis: queue.hypothesis,
+  method: queue.method,
+  kill_criteria: queue.kill_criteria
+}, null, 2)}
+
+EXECUTION OUTPUT:
+${output}
+
+EVIDENCE PACKET:
+${JSON.stringify(packet, null, 2)}
+`, 1200, 0.1);
+      decision = parseExperimentDecision(reviewOutput);
+
+      await env.DB.prepare(`
+        INSERT INTO experiment_provenance
+          (experiment_id, queue_id, rotation_id, phase, provenance)
+        VALUES (?, ?, ?, 'vector-review', ?)
+      `).bind(
+        queue.experiment_id,
+        queue.queue_id,
+        workerRid,
+        cleanText(reviewOutput, 30000)
+      ).run();
+
+      await env.DB.prepare(`
+        INSERT INTO experiment_reviews
+          (experiment_id, queue_id, reviewer, decision, review)
+        VALUES (?, ?, 'VECTOR', ?, ?)
+      `).bind(queue.experiment_id, queue.queue_id, decision, cleanText(reviewOutput, 12000)).run();
+    }
+
+    const experimentStatus = executionStatus === 'COMPLETED' ? 'completed'
+      : executionStatus === 'BLOCKED' ? 'blocked' : 'failed';
+
+    await env.DB.prepare(`
+      UPDATE experiments
+      SET result = ?, information_gained = ?, decision = ?, status = ?,
+          completed_at = CASE WHEN ? IN ('completed','failed') THEN CURRENT_TIMESTAMP ELSE completed_at END,
+          last_updated = CURRENT_TIMESTAMP, actual_spend = 0
+      WHERE id = ?
+    `).bind(
+      cleanText(output, 12000), cleanText(reviewOutput || output, 12000), decision,
+      experimentStatus, experimentStatus, queue.experiment_id
+    ).run();
+
+    await env.DB.prepare(`
+      UPDATE experiment_queue
+      SET status = ?, completed_at = CASE WHEN ? IN ('completed','failed') THEN CURRENT_TIMESTAMP ELSE completed_at END,
+          last_updated = CURRENT_TIMESTAMP, diagnostic = ?
+      WHERE id = ?
+    `).bind(finalQueueStatus, finalQueueStatus,
+      `Execution=${executionStatus}; Vector=${decision}`, queue.queue_id).run();
+
+    if (queue.opportunity_id) {
+      await env.DB.prepare(`
+        UPDATE opportunities
+        SET stage = ?, status = ?, next_test = ?, last_updated = CURRENT_TIMESTAMP
+        WHERE id = ?
+      `).bind(
+        decision === 'KILL' ? 'killed' : decision === 'ADVANCE' ? 'validated' : 'validation',
+        decision === 'KILL' ? 'killed' : decision === 'ESCALATE' ? 'owner-review' : 'active',
+        cleanText(reviewOutput || output, 2000), queue.opportunity_id
+      ).run();
+    }
+
+    await slack(env, VIS.channels.experiments, [
+      '*VIS EXPERIMENT EXECUTION*',
+      `Experiment: ${queue.experiment_id}`,
+      `Opportunity: ${queue.opportunity_id || 'NONE'}`,
+      `Execution: ${executionStatus}`,
+      `Vector decision: ${decision}`,
+      '', cleanText(output, 7000),
+      reviewOutput ? `\n*VECTOR REVIEW*\n${cleanText(reviewOutput, 7000)}` : '',
+      '', 'External spend: $0.00'
+    ].filter(Boolean).join('\n'));
+
+    if (decision === 'ESCALATE') {
+      await slack(env, VIS.channels.ownerReview, [
+        '*VIS OWNER DECISION REQUIRED*',
+        `Experiment: ${queue.experiment_id}`,
+        `Opportunity: ${queue.opportunity_id || 'NONE'}`,
+        'Vector determined the next useful step requires Founder authority.',
+        '', cleanText(reviewOutput, 5000),
+        '', 'No external action has been taken. External spend: $0.00'
+      ].join('\n'));
+    }
+
+    await finishRotation(env, workerRid, `Experiment ${queue.experiment_id}: ${executionStatus}; Vector=${decision}`,
+      executionStatus === 'FAILED' ? 'failed' : 'completed');
+    await audit(env, 'EXPERIMENT_WORKER', 'EXPERIMENT_EXECUTED', queue.experiment_id,
+      `status=${executionStatus}; decision=${decision}; spend=0`);
+
+    await env.DB.prepare(`
+      UPDATE failures
+      SET resolved = 1
+      WHERE resolved = 0
+        AND component = 'experiment-execution'
+        AND created_at < CURRENT_TIMESTAMP
+    `).run();
+
+    return { executed: true, experimentId: queue.experiment_id, executionStatus, decision, externalSpendUSD: 0 };
+  } catch (error) {
+    await env.DB.prepare(`
+      UPDATE experiment_queue
+      SET status = CASE WHEN attempts >= 3 THEN 'quarantined' ELSE 'queued' END,
+          diagnostic = ?, last_updated = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).bind(cleanText(error?.message || error, 2000), queue.queue_id).run();
+    await env.DB.prepare(`
+      UPDATE experiments SET status = 'approved', last_updated = CURRENT_TIMESTAMP WHERE id = ?
+    `).bind(queue.experiment_id).run();
+    await finishRotation(env, workerRid, cleanText(error?.message || error, 3000), 'failed');
+    await recordFailure(env, workerRid, 'experiment-execution', error);
+    return { executed: true, experimentId: queue.experiment_id, executionStatus: 'FAILED',
+      decision: 'RETRY_OR_QUARANTINE', error: cleanText(error?.message || error, 1000), externalSpendUSD: 0 };
+  }
+}
 
 /* ============================================================
    MAIN MACHINE
@@ -1749,6 +2396,18 @@ async function runVIS(
       rid,
       source
     );
+
+    stage =
+      "experiment-queue-sync";
+
+    await synchronizeApprovedExperiments(env);
+    await watchdogExperiments(env);
+
+    stage =
+      "experiment-execution";
+
+    const experimentExecution =
+      await executeNextApprovedExperiment(env, rid);
 
     stage =
       "sensor-network";
@@ -1838,7 +2497,7 @@ async function runVIS(
     stage =
       "atlas-ai";
 
-    const atlasOutput =
+    let atlasOutput =
       await think(
         env,
         ATLAS_SYSTEM,
@@ -1881,6 +2540,26 @@ before revival.
         1100,
         0.55
       );
+
+    stage =
+      "atlas-quality";
+
+    const atlasRepair =
+      await selfRepairReasoning(
+        env, rid, "ATLAS", rid, atlasOutput, selected,
+        `SCOUT ANALYSIS:
+${scout.output}
+
+INSTITUTIONAL MEMORY:
+${JSON.stringify(context, null, 2)}`
+      );
+
+    atlasOutput = atlasRepair.output;
+    const atlasQuality = atlasRepair.quality;
+
+    if (!atlasRepair.accepted) {
+      throw new Error(`ATLAS reasoning quarantined after bounded repair attempts: ${atlasQuality.flags.join(", ")}`);
+    }
 
     stage =
       "atlas-persistence";
@@ -1964,7 +2643,7 @@ before revival.
     stage =
       "vector-ai";
 
-    const vectorOutput =
+    let vectorOutput =
       await think(
         env,
         VECTOR_SYSTEM,
@@ -1976,13 +2655,13 @@ ATLAS MEMORANDUM:
 
 ${atlasOutput}
 
-CURRENT SCOUT-SHORTLISTED EVIDENCE:
+CURRENT ROTATION EVIDENCE PACKET:
 
 ${JSON.stringify(selected, null, 2)}
 
-VIS INSTITUTIONAL MEMORY:
-
-${JSON.stringify(context, null, 2)}
+CONTEXT BOUNDARY:
+Use only this Atlas memorandum and this current rotation evidence packet.
+Prior VIS opportunities and prior research are intentionally excluded.
 
 Independently determine whether Atlas has found
 something commercially worth testing.
@@ -1996,6 +2675,25 @@ falsification test.
         1100,
         0.25
       );
+
+    stage =
+      "vector-quality";
+
+    const vectorRepair =
+      await selfRepairReasoning(
+        env, rid, "VECTOR", vectorRid, vectorOutput, selected,
+        `ATLAS MEMORANDUM:
+${atlasOutput}
+
+CONTEXT BOUNDARY: Use only the Atlas memorandum and current rotation evidence packet.`
+      );
+
+    vectorOutput = vectorRepair.output;
+    const vectorQuality = vectorRepair.quality;
+
+    if (!vectorRepair.accepted) {
+      throw new Error(`VECTOR reasoning quarantined after bounded repair attempts: ${vectorQuality.flags.join(", ")}`);
+    }
 
     stage =
       "vector-persistence";
@@ -2080,13 +2778,60 @@ falsification test.
     );
 
     stage =
+      "failure-reconciliation";
+
+    if (atlasQuality?.passed) {
+      await env.DB.prepare(`
+        UPDATE failures
+        SET resolved = 1
+        WHERE resolved = 0
+          AND component = 'atlas-quality'
+          AND created_at < CURRENT_TIMESTAMP
+      `).run();
+    }
+
+    if (vectorQuality?.passed) {
+      await env.DB.prepare(`
+        UPDATE failures
+        SET resolved = 1
+        WHERE resolved = 0
+          AND component = 'vector-quality'
+          AND created_at < CURRENT_TIMESTAMP
+      `).run();
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO acceptance_telemetry
+        (
+          rotation_id,
+          experiment_id,
+          atlas_quality_passed,
+          vector_quality_passed,
+          experiment_executed,
+          experiment_status,
+          experiment_decision,
+          slack_synchronized,
+          external_spend_usd
+        )
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, 0)
+    `).bind(
+      rid,
+      experimentExecution?.experimentId || null,
+      atlasQuality?.passed ? 1 : 0,
+      vectorQuality?.passed ? 1 : 0,
+      experimentExecution?.executed ? 1 : 0,
+      experimentExecution?.executionStatus || null,
+      experimentExecution?.decision || null
+    ).run();
+
+    stage =
       "health";
 
     await health(
       env,
       "vis-runtime",
       "healthy",
-      `V1.6 complete ${rid}; new=${newItems.length}; shortlisted=${selected.length}`
+      `V1.7 development complete ${rid}; new=${newItems.length}; shortlisted=${selected.length}`
     );
 
     stage =
@@ -2112,6 +2857,10 @@ falsification test.
       scoutShortlist: selected.length,
       atlas: "completed",
       vector: "completed",
+      atlasQuality,
+      vectorQuality,
+      experimentQueueSynchronized: true,
+      experimentExecution,
       persisted: true,
       slackSynchronized: true,
       externalSpendUSD: 0
@@ -2294,7 +3043,7 @@ async function getStatus(env) {
       "online",
 
     architecture:
-      "Sensors -> Scout -> Atlas -> Vector",
+      "Approved Experiments -> Worker -> Evidence -> Vector Review + Sensors -> Scout -> Atlas -> Vector",
 
     model:
       VIS.model,
@@ -2328,6 +3077,19 @@ async function getStatus(env) {
     recentRotations:
       rotations.results || []
   };
+}
+
+async function getExperimentStatus(env) {
+  await ensureSchema(env);
+  const queue = await env.DB.prepare(`
+    SELECT q.id, q.experiment_id, q.opportunity_id, q.status, q.assigned_to, q.attempts,
+           q.queued_at, q.started_at, q.completed_at, q.last_updated, q.diagnostic,
+           e.hypothesis, e.decision, e.actual_spend
+    FROM experiment_queue q
+    LEFT JOIN experiments e ON e.id = q.experiment_id
+    ORDER BY q.queued_at DESC LIMIT 20
+  `).all();
+  return { ok: true, version: VIS.version, queue: queue.results || [], externalSpendUSD: 0 };
 }
 
 async function testAI(env) {
@@ -2369,7 +3131,7 @@ export default {
           status:
             "online",
           architecture:
-            "Sensors -> Scout -> Atlas -> Vector"
+            "Experiments + Sensors -> Department Heads -> Institutional Memory"
         });
       }
 
@@ -2424,6 +3186,43 @@ export default {
         ) {
           return json(
             await getLatestFailure(env)
+          );
+        }
+
+        if (
+          url.pathname ===
+          "/admin/experiment-status"
+        ) {
+          return json(
+            await getExperimentStatus(env)
+          );
+        }
+
+        if (
+          url.pathname ===
+            "/admin/synchronize-experiments" &&
+          request.method === "POST"
+        ) {
+          await ensureSchema(env);
+          await synchronizeApprovedExperiments(env);
+
+          return json({
+            ok: true,
+            version: VIS.version,
+            synchronized: true,
+            experimentStatus:
+              await getExperimentStatus(env),
+            externalSpendUSD: 0
+          });
+        }
+
+        if (
+          url.pathname ===
+            "/admin/recover-runtime-state" &&
+          request.method === "POST"
+        ) {
+          return json(
+            await recoverStaleRuntimeState(env)
           );
         }
 
