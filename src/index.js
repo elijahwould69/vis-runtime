@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.6-development",
+  version: "1.8.1-operational",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -754,6 +754,18 @@ async function ensureSchema(env) {
       id TEXT PRIMARY KEY, work_order_id TEXT NOT NULL, planner_level TEXT NOT NULL, planner_agent TEXT NOT NULL,
       planning_mode TEXT NOT NULL, attempts INTEGER DEFAULT 0, valid INTEGER DEFAULT 0,
       diagnostic TEXT, plan_json TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS operational_objectives (
+      id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, work_order_id TEXT UNIQUE,
+      objective TEXT NOT NULL, requested_by TEXT NOT NULL, authority_scope TEXT DEFAULT 'internal-zero-dollar',
+      priority INTEGER DEFAULT 1, status TEXT DEFAULT 'queued', decision_package_id TEXT,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP, started_at TEXT, completed_at TEXT, last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS founder_decision_packages (
+      id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, work_order_id TEXT NOT NULL,
+      department_synthesis_id TEXT, challenge_id TEXT, reintegrated_knowledge_id TEXT,
+      package TEXT NOT NULL, status TEXT DEFAULT 'ready', founder_action_required INTEGER DEFAULT 0,
+      authority_scope TEXT DEFAULT 'internal-zero-dollar', created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`
   ];
 
@@ -769,7 +781,9 @@ async function ensureSchema(env) {
     `CREATE INDEX IF NOT EXISTS idx_manager_assignments_work ON manager_assignments(work_order_id)`,
     `CREATE INDEX IF NOT EXISTS idx_manager_syntheses_work ON manager_syntheses(work_order_id)`,
     `CREATE INDEX IF NOT EXISTS idx_it_incidents_status ON it_incidents(status)`,
-    `CREATE INDEX IF NOT EXISTS idx_planning_telemetry_work ON planning_telemetry(work_order_id)`
+    `CREATE INDEX IF NOT EXISTS idx_planning_telemetry_work ON planning_telemetry(work_order_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_operational_objectives_status ON operational_objectives(status,priority,created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_founder_packages_work ON founder_decision_packages(work_order_id)`
   ];
   for (const sql of v18Indexes) await env.DB.prepare(sql).run();
 
@@ -4431,6 +4445,136 @@ async function runOperationalAcceptanceTest(env) {
   return {ok:passed,test:'OAT-001',version:VIS.version,testId,workOrderId:wo,objective,planningMode:planning.planningMode,planningAttempts:planning.attempts,planningTelemetryId:planning.telemetryId,departmentSynthesisMode:departmentMode,managerCount:assignments.length,workerCount:workers.length,repair,departmentSynthesisId:dsId,challengeId:challenge.id,reintegratedKnowledgeId:knowledgeId,checks,counts,externalSpendUSD:0};
 }
 
+
+const OPERATIONAL_WORKER_SYSTEM = `
+You are a constrained VIS operational worker performing real internal company analysis.
+Use ONLY the inherited Hive knowledge packet and the stated objective. Do not invent current facts, customers, contracts, prices, projects, or evidence.
+Clearly separate: EVIDENCE, INFERENCES, UNKNOWNS, NEXT INTERNAL RESEARCH, KILL/ESCALATION CRITERIA.
+No external contact, spending, publishing, commitments, account creation, legal/compliance representation, or consequential action.
+`;
+
+async function runOperationalWorker(env, workerJobId) {
+  const job=await env.DB.prepare(`SELECT * FROM worker_jobs WHERE id=?`).bind(workerJobId).first();
+  if(!job) throw new Error('Operational worker missing.');
+  assertInternalAuthority(job.authority_scope);
+  const lineage=await validateWorkerLineage(env,job.rotation_id,job.id);
+  if(!lineage.ok) throw new Error('Operational worker lineage invalid.');
+  const packet=await loadPacket(env,job.knowledge_packet_id);
+  await env.DB.prepare(`UPDATE worker_jobs SET status='running',attempts=attempts+1,started_at=COALESCE(started_at,?),last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),job.id).run();
+  let output;
+  try {
+    output=await think(env,OPERATIONAL_WORKER_SYSTEM,`WORK ORDER: ${job.rotation_id}\nROLE: ${job.worker_role}\nMANDATE: ${job.mandate}\nAUTHORITY: ${job.authority_scope}\nINHERITED PACKET: ${packet.content}\nPACKET PROVENANCE: ${packet.provenance}`,1400,.3);
+    if(!workerOutputUsable(output)) throw new Error('Operational worker returned unusable output.');
+  } catch(error) {
+    const incidentId=await openITIncident(env,{workOrderId:job.rotation_id,incidentType:'WORKER_FAILURE',component:'operational-worker',diagnosis:`Operational worker failed: ${cleanText(error?.message||String(error),1200)}`,authorityScope:job.authority_scope});
+    const repair=await generalizedJanitorRepair(env,{incidentId,workerJobId:job.id});
+    return {recovered:true,...repair};
+  }
+  const links=await env.DB.prepare(`SELECT knowledge_id FROM knowledge_inheritance WHERE work_order_id=? AND worker_job_id=?`).bind(job.rotation_id,job.id).all();
+  const resultId=await submitWorkerResult(env,{workOrderId:job.rotation_id,workerJobId:job.id,resultType:'operational-analysis',result:output,evidenceRefs:(links.results||[]).map(x=>x.knowledge_id),confidence:.7});
+  return {resultId,recovered:false};
+}
+
+async function createFounderDecisionPackage(env, record) {
+  assertInternalAuthority(record.authorityScope||'internal-zero-dollar');
+  const id=`FDP-${crypto.randomUUID()}`;
+  const packageText=`FOUNDER DECISION PACKAGE\nOBJECTIVE: ${record.objective}\n\nDISCOVERY SYNTHESIS:\n${record.departmentSynthesis}\n\nINDEPENDENT VECTOR CHALLENGE:\n${record.challengeReview}\n\nVECTOR DECISION: ${record.challengeDecision}\n\nAUTHORITY: internal-zero-dollar. No external action has been taken. Any spend, prospect contact, bid/submission, public publishing, consequential account creation, contract, payment, legal/compliance representation, or other consequential external action requires Founder approval.`;
+  const founderActionRequired=record.challengeDecision==='HOLD'?1:0;
+  await env.DB.prepare(`INSERT INTO founder_decision_packages
+    (id,objective_id,work_order_id,department_synthesis_id,challenge_id,reintegrated_knowledge_id,package,status,founder_action_required,authority_scope)
+    VALUES (?,?,?,?,?,?,?,'ready',?,?)`).bind(id,record.objectiveId,record.workOrderId,record.departmentSynthesisId,record.challengeId,record.knowledgeId,cleanText(packageText,20000),founderActionRequired,record.authorityScope||'internal-zero-dollar').run();
+  return {id,package:packageText,founderActionRequired};
+}
+
+async function processOperationalObjective(env, objectiveId) {
+  await ensureSchema(env);
+  const row=await env.DB.prepare(`SELECT * FROM operational_objectives WHERE id=?`).bind(objectiveId).first();
+  if(!row) throw new Error('Operational objective not found.');
+  assertInternalAuthority(row.authority_scope);
+  if(row.status==='completed') return {ok:true,alreadyCompleted:true,objectiveId:row.id,workOrderId:row.work_order_id,decisionPackageId:row.decision_package_id};
+  if(row.status==='running') return {ok:true,alreadyRunning:true,objectiveId:row.id,workOrderId:row.work_order_id};
+  const wo=row.work_order_id||`DCC-WO-${crypto.randomUUID()}`;
+  try {
+    await env.DB.prepare(`UPDATE operational_objectives SET status='running',work_order_id=?,started_at=COALESCE(started_at,?),last_updated=? WHERE id=?`).bind(wo,nowISO(),nowISO(),row.id).run();
+    const existingWO=await env.DB.prepare(`SELECT id FROM work_orders WHERE id=?`).bind(wo).first();
+    if(!existingWO) await createWorkOrder(env,{id:wo,objective:row.objective,requestedBy:row.requested_by,authorityScope:row.authority_scope,priority:row.priority});
+    await env.DB.prepare(`UPDATE work_orders SET status='running',started_at=COALESCE(started_at,?),last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),wo).run();
+    const seedObjective=await createHiveKnowledge(env,{knowledgeType:'founder-objective',subject:`Operational objective ${row.id}`,content:row.objective,confidence:1,verificationStatus:'founder-supplied',sourceType:'founder-intake',sourceRef:row.id});
+    const seedPolicy=await createHiveKnowledge(env,{knowledgeType:'operating-policy',subject:'DCC operational authority boundary',content:'VIS may perform internal zero-dollar research, analysis, synthesis, worker coordination, recovery, and documentation. It may not contact prospects, submit bids, spend money, publish publicly, create consequential accounts, enter agreements, make payments, or make legal/compliance representations without explicit Founder approval. Unknown current facts must remain unknown until supported by evidence.',confidence:1,verificationStatus:'operating-policy',sourceType:'hive-policy',sourceRef:'V1.8.1'});
+    const recentEvidence=await env.DB.prepare(`SELECT source_name,item_url,title,evidence_text,verification_status,retrieved_at FROM evidence ORDER BY id DESC LIMIT 20`).all();
+    const recentResearch=await env.DB.prepare(`SELECT agent_id,finding,evidence,implication,recommended_action,created_at FROM research ORDER BY rowid DESC LIMIT 12`).all();
+    const seedResearch=await createHiveKnowledge(env,{knowledgeType:'current-internal-evidence',subject:`Recent VIS evidence for ${row.id}`,content:JSON.stringify({evidence:recentEvidence.results||[],research:recentResearch.results||[]}),confidence:.7,verificationStatus:'retrieved-and-internal-analysis',sourceType:'vis-runtime',sourceRef:row.id});
+    const seeds=[seedObjective,seedPolicy,seedResearch];
+    const planning=await aiPrimaryManagerPlan(env,{workOrderId:wo,objective:row.objective,knowledgeIds:seeds,authorityScope:row.authority_scope});
+    const assignments=[];
+    for(const spec of planning.plan) assignments.push({...spec,...await createManagerAssignment(env,{workOrderId:wo,departmentId:'DISCOVERY',managerAgent:spec.name,mandate:spec.mandate,objective:row.objective,knowledgeIds:seeds,authorityScope:row.authority_scope})});
+    const workers=[];
+    for(const a of assignments) {
+      await env.DB.prepare(`UPDATE manager_assignments SET status='running',started_at=COALESCE(started_at,?),last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),a.id).run();
+      for(const spec of [
+        {role:`${a.name} Evidence Specialist`,mandate:`Develop evidence-backed internal analysis for: ${a.mandate}. Identify what is supported, what is inferred, and what current evidence is still missing.`},
+        {role:`${a.name} Falsification Specialist`,mandate:`Challenge assumptions and define failure modes, kill criteria, and the highest-value next internal research for: ${a.mandate}.`}
+      ]) workers.push({assignment:a,...await createConstrainedWorkerJob(env,{workOrderId:wo,departmentId:'DISCOVERY',managerAgent:a.managerId,workerRole:spec.role,mandate:spec.mandate,knowledgeIds:seeds,authorityScope:row.authority_scope})});
+    }
+    for(const w of workers) await runOperationalWorker(env,w.id);
+    const managerSyntheses=[];
+    for(const a of assignments) managerSyntheses.push(await createManagerSynthesis(env,{workOrderId:wo,assignmentId:a.id}));
+    const head=await env.DB.prepare(`SELECT agent_id FROM department_heads WHERE department_id='DISCOVERY' AND status='active'`).first();
+    let departmentText,departmentMode='ai-primary';
+    try { departmentText=await think(env,HAT_HEAD_SYSTEM,`WORK ORDER: ${wo}\nREAL OPERATIONAL OBJECTIVE: ${row.objective}\nMANAGER SYNTHESES: ${JSON.stringify(managerSyntheses)}\nProduce a Founder-ready internal recommendation. Do not invent current facts. Preserve evidence gaps, uncertainty, kill criteria, and actions requiring Founder approval.`,1600,.25); }
+    catch(error) { departmentMode='deterministic-fallback'; departmentText=`SYNTHESIS: deterministic compression after bounded AI failure.\nMANAGER OUTPUTS: ${JSON.stringify(managerSyntheses)}\nLIMITATIONS: ${cleanText(error?.message||String(error),1000)}`; }
+    await recordPlanningTelemetry(env,{workOrderId:wo,plannerLevel:'department-synthesis',plannerAgent:head?.agent_id||'ATLAS',planningMode:departmentMode,attempts:departmentMode==='ai-primary'?1:3,valid:true,diagnostic:departmentMode==='ai-primary'?'AI operational department synthesis completed.':'Fallback operational department synthesis used.',plan:{managerSynthesisIds:managerSyntheses.map(x=>x.id)}});
+    const dsId=`DS-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO department_syntheses (id,work_order_id,department_id,head_agent,synthesis,evidence_refs,worker_result_refs,status) VALUES (?,?,?,?,?,?,?,'submitted')`).bind(dsId,wo,'DISCOVERY',head?.agent_id||'ATLAS',cleanText(departmentText,12000),JSON.stringify(seeds),JSON.stringify(managerSyntheses.flatMap(x=>x.workerRefs))).run();
+    const challenge=await createCrossDepartmentReview(env,{workOrderId:wo,reviewerDepartmentId:'DILIGENCE',subjectSynthesisId:dsId,objective:row.objective});
+    const knowledgeId=await reintegrateHiveKnowledge(env,{workOrderId:wo,synthesisId:dsId,reviewRefs:[challenge.id],knowledgeType:'operational-learning',subject:`Operational learning ${row.id}`,content:`DISCOVERY synthesis: ${departmentText}\nIndependent DILIGENCE review: ${challenge.review}`,confidence:.75,verificationStatus:'vector-reviewed',disposition:challenge.decision==='REJECT'?'held':'accepted',rationale:'Real operational work completed under internal-zero-dollar authority with independent challenge.'});
+    const pkg=await createFounderDecisionPackage(env,{objectiveId:row.id,workOrderId:wo,objective:row.objective,departmentSynthesisId:dsId,departmentSynthesis:departmentText,challengeId:challenge.id,challengeReview:challenge.review,challengeDecision:challenge.decision,knowledgeId,authorityScope:row.authority_scope});
+    await env.DB.prepare(`UPDATE work_orders SET status='completed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),wo).run();
+    await env.DB.prepare(`UPDATE operational_objectives SET status='completed',decision_package_id=?,completed_at=?,last_updated=? WHERE id=?`).bind(pkg.id,nowISO(),nowISO(),row.id).run();
+    await audit(env,'HIVE_OPERATIONAL_INTAKE','OBJECTIVE_COMPLETED',wo,JSON.stringify({objectiveId:row.id,planningMode:planning.planningMode,departmentMode,managerCount:assignments.length,workerCount:workers.length,challengeDecision:challenge.decision,decisionPackageId:pkg.id,externalSpendUSD:0}));
+    return {ok:true,objectiveId:row.id,workOrderId:wo,status:'completed',planningMode:planning.planningMode,departmentSynthesisMode:departmentMode,managerCount:assignments.length,workerCount:workers.length,challengeDecision:challenge.decision,decisionPackageId:pkg.id,reintegratedKnowledgeId:knowledgeId,externalSpendUSD:0};
+  } catch(error) {
+    await env.DB.prepare(`UPDATE operational_objectives SET status='failed',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
+    await env.DB.prepare(`UPDATE work_orders SET status='failed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),wo).run().catch(()=>{});
+    await recordFailure(env,wo,'operational-intake',error);
+    throw error;
+  }
+}
+
+async function intakeOperationalObjective(env, request) {
+  await ensureSchema(env);
+  let body;
+  try { body=await request.json(); } catch { throw new Error('Operational intake requires a JSON body.'); }
+  const objective=cleanText(body?.objective,4000);
+  const key=cleanText(body?.idempotencyKey,200);
+  if(!objective || objective.length<20) throw new Error('Objective must contain at least 20 characters.');
+  if(!key) throw new Error('idempotencyKey is required.');
+  const authority='internal-zero-dollar';
+  assertInternalAuthority(authority);
+  const prior=await env.DB.prepare(`SELECT * FROM operational_objectives WHERE idempotency_key=?`).bind(key).first();
+  if(prior) return {ok:true,idempotentReplay:true,objectiveId:prior.id,workOrderId:prior.work_order_id,status:prior.status,decisionPackageId:prior.decision_package_id,externalSpendUSD:0};
+  const id=cleanText(body?.objectiveId,120)||`OBJ-${crypto.randomUUID()}`;
+  await env.DB.prepare(`INSERT INTO operational_objectives (id,idempotency_key,objective,requested_by,authority_scope,priority,status,last_updated) VALUES (?,?,?,?,?,?,'queued',?)`).bind(id,key,objective,cleanText(body?.requestedBy,200)||'FOUNDER','internal-zero-dollar',Math.max(1,Math.min(5,Number(body?.priority||1))),nowISO()).run();
+  await audit(env,'HIVE_OPERATIONAL_INTAKE','OBJECTIVE_ACCEPTED',id,JSON.stringify({idempotencyKey:key,authorityScope:authority,externalSpendUSD:0}));
+  if(body?.executeNow===false) return {ok:true,objectiveId:id,status:'queued',externalSpendUSD:0};
+  return await processOperationalObjective(env,id);
+}
+
+async function continueOperationalQueue(env) {
+  await ensureSchema(env);
+  const next=await env.DB.prepare(`SELECT id FROM operational_objectives WHERE status='queued' ORDER BY priority DESC,created_at ASC LIMIT 1`).first();
+  if(!next) return {ok:true,processed:false};
+  return await processOperationalObjective(env,next.id);
+}
+
+async function getOperationalObjective(env,id) {
+  await ensureSchema(env);
+  const objective=await env.DB.prepare(`SELECT * FROM operational_objectives WHERE id=?`).bind(id).first();
+  if(!objective) return {ok:false,error:'Operational objective not found.'};
+  const pkg=objective.decision_package_id?await env.DB.prepare(`SELECT * FROM founder_decision_packages WHERE id=?`).bind(objective.decision_package_id).first():null;
+  return {ok:true,objective,decisionPackage:pkg};
+}
+
 async function runElasticDepartmentAcceptance(env) {
   await ensureSchema(env);
   const testId=`EAT-001-${Date.now()}-${crypto.randomUUID().slice(0,8)}`;
@@ -4619,6 +4763,28 @@ export default {
 
 
         if (
+          url.pathname === "/admin/objectives" &&
+          request.method === "POST"
+        ) {
+          return json(await intakeOperationalObjective(env, request));
+        }
+
+        if (
+          url.pathname === "/admin/objectives/continue" &&
+          request.method === "POST"
+        ) {
+          return json(await continueOperationalQueue(env));
+        }
+
+        if (
+          url.pathname.startsWith("/admin/objectives/") &&
+          request.method === "GET"
+        ) {
+          const objectiveId=decodeURIComponent(url.pathname.slice("/admin/objectives/".length));
+          return json(await getOperationalObjective(env, objectiveId));
+        }
+
+        if (
           url.pathname === "/admin/operational-acceptance-test" &&
           request.method === "POST"
         ) {
@@ -4730,11 +4896,9 @@ export default {
     env,
     ctx
   ) {
-    ctx.waitUntil(
-      runVIS(
-        env,
-        `cron:${controller.cron}`
-      )
-    );
+    ctx.waitUntil((async()=>{
+      await runVIS(env,`cron:${controller.cron}`);
+      await continueOperationalQueue(env);
+    })());
   }
 };
