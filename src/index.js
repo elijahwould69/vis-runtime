@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.23-detail-evidence-bridge",
+  version: "1.8.24-canonical-procurement-record-filter",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -902,6 +902,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.21-001','1.8.21','Transaction identity lock: candidate discovery is separated from transaction evidence; critical fields must converge on one canonical procurement record before qualification')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.22-001','1.8.22','Procurement detail-page discovery: search pages discover candidates; bounded source adapters resolve and fetch individual procurement records before identity qualification; acceptance missions quarantined from cron continuation')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.23-001','1.8.23','Detail Evidence Bridge: canonical procurement detail records bypass broad-page specialist gating and feed transaction extraction directly; identity lock remains fail-closed')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.24-001','1.8.24','Canonical Procurement Record Filter: utility and navigation pages are rejected; fetched candidates must contain transaction-shaped content before entering evidence extraction; identity lock remains fail-closed')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -4998,15 +4999,26 @@ function extractResearchLinks(doc){
   return out;
 }
 
+function procurementUtilityPath(url=''){
+  try{
+    const u=new URL(String(url||''));
+    const path=u.pathname.replace(/\/+$/,'').toLowerCase();
+    return /\/(subscribe(?:-link)?|request-contract-history-letter|contract-history(?:-letter)?|help|support|contact|about|login|sign-in|signin|register|registration|account|profile|search|advanced-search|rss|feed|sitemap|accessibility|terms|privacy)(?:\/|$)/i.test(path)
+      || /\/(guidance|guide|how-to|learn|resources?)(?:\/|$)/i.test(path);
+  }catch(_){ return true; }
+}
+
 function procurementDetailCandidate(sourceId,url,anchor=''){
   let u; try{u=new URL(url);}catch(_){return false;}
   const path=u.pathname.replace(/\/+$/,'');
   const text=`${path} ${anchor}`.toLowerCase();
+  if(procurementUtilityPath(url)) return false;
   if(sourceId.startsWith('SRC-CANADABUYS')){
     if(!/canadabuys\.canada\.ca$/i.test(u.hostname)) return false;
     if(u.searchParams.has('words')||u.searchParams.has('current_tab')||u.searchParams.has('items_per_page')) return false;
-    return /tender-opportunit.*\/(tender-notice|award-notice|notice|[a-z0-9-]{8,})/i.test(path)
-      || /solicitation|tender notice|award notice|contract history/i.test(text);
+    return /tender-opportunit.*\/(tender-notice|award-notice|notice)(?:\/|$)/i.test(path)
+      || /\/(tender-notice|award-notice|solicitation|contract-award|notice)\/[a-z0-9-]{4,}(?:\/|$)/i.test(path)
+      || /solicitation|tender notice|award notice|contract award/i.test(text);
   }
   if(sourceId==='SRC-BC-DIGITAL-MARKETPLACE-TXN'){
     if(!/marketplace\.digital\.gov\.bc\.ca$/i.test(u.hostname)) return false;
@@ -5015,6 +5027,33 @@ function procurementDetailCandidate(sourceId,url,anchor=''){
   return false;
 }
 
+function procurementDocumentLooksCanonical(doc){
+  if(!doc?.url||!doc?.text||procurementUtilityPath(doc.url)) return false;
+  const text=String(doc.text||'').replace(/\s+/g,' ').toLowerCase();
+  if(text.length<350) return false;
+
+  // V1.8.24: URL shape is only candidate discovery. Content must look like one
+  // procurement record before the document can enter transaction extraction.
+  const signals=[
+    /\b(solicitation|tender|procurement|contract|award|notice)\s*(number|no\.?|id|identifier|reference)\b/i.test(text),
+    /\bclosing\s*(date|time)|submission\s*deadline|bid\s*deadline\b/i.test(text),
+    /\bpublication\s*date|published\s*(on|date)|issue\s*date\b/i.test(text),
+    /\bcontracting\s*authority|procuring\s*(entity|organization)|buyer\s*(organization|name)?\b/i.test(text),
+    /\bnotice\s*type|procurement\s*type|solicitation\s*type|tender\s*type\b/i.test(text),
+    /\baward\s*(date|amount|value|supplier)|contract\s*(value|amount)\b/i.test(text),
+    /\bdescription\s+of\s+(work|requirement|procurement)|statement\s+of\s+work|scope\s+of\s+work\b/i.test(text),
+    /\bunspsc\b|\bgsin\b|\bcommodity\s*(code|category)\b/i.test(text)
+  ].filter(Boolean).length;
+
+  const utilitySignals=[
+    /subscribe\s+to\s+(tender|notification|opportunit)/i.test(text),
+    /request\s+(a\s+)?contract\s+history\s+letter/i.test(text),
+    /contracts?\s+.*awarded\s+to\s+your\s+business/i.test(text),
+    /sign\s+in|create\s+an\s+account|register\s+for/i.test(text)
+  ].filter(Boolean).length;
+
+  return signals>=2 && utilitySignals<2;
+}
 async function discoverProcurementDetailDocuments(env,searchDoc,budget,maxDetails=3){
   const links=extractResearchLinks(searchDoc)
     .filter(x=>procurementDetailCandidate(searchDoc.sourceId,x.url,x.text))
@@ -5026,7 +5065,11 @@ async function discoverProcurementDetailDocuments(env,searchDoc,budget,maxDetail
     const sourceId=`${searchDoc.sourceId}-DETAIL-${(await researchFingerprint(link.url)).slice(0,10)}`;
     const d=await fetchResearchDocument(env,sourceId,link.url);
     if(!d?.text) continue;
-    docs.push({...d,sourceId,sourceClass:'procurement',name:`${searchDoc.name} — individual procurement record`,quality:1.0,discoveredFrom:searchDoc.url});
+    if(!procurementDocumentLooksCanonical(d)){
+      try{ await audit(env,'ADAPTIVE_RESEARCH','PROCUREMENT_CANDIDATE_REJECTED',searchDoc.sourceId,JSON.stringify({candidateUrl:link.url,discoveredFrom:searchDoc.url,reason:'not-transaction-shaped',externalSpendUSD:0})); }catch(_){}
+      continue;
+    }
+    docs.push({...d,sourceId,sourceClass:'procurement',name:`${searchDoc.name} — canonical procurement record`,quality:1.0,discoveredFrom:searchDoc.url});
   }
   return docs;
 }
@@ -5314,7 +5357,8 @@ function transactionSourceIsCanonical(url=''){
     if(!/^https?:$/.test(u.protocol)) return false;
     if(q.has('words')||q.has('current_tab')||q.has('items_per_page')||q.has('search')||q.has('query')||q.has('keywords')) return false;
     if(/\/tender-opportunities$/i.test(path)||/\/opportunities$/i.test(path)||/\/search$/i.test(path)) return false;
-    if(/canadabuys\.canada\.ca$/i.test(u.hostname)) return /tender-opportunit.*\/(tender-notice|award-notice|notice|[a-z0-9-]{8,})/i.test(path);
+    if(procurementUtilityPath(url)) return false;
+    if(/canadabuys\.canada\.ca$/i.test(u.hostname)) return /tender-opportunit.*\/(tender-notice|award-notice|notice)(?:\/|$)/i.test(path) || /\/(tender-notice|award-notice|solicitation|contract-award|notice)\/[a-z0-9-]{4,}(?:\/|$)/i.test(path);
     if(/marketplace\.digital\.gov\.bc\.ca$/i.test(u.hostname)) return /opportunit|procurement|contract|award/i.test(path) && path.split('/').filter(Boolean).length>=2;
     return path.split('/').filter(Boolean).length>=3;
   }catch(_){ return false; }
