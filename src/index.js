@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.19-crash-safe-transaction-discovery",
+  version: "1.8.20-transaction-evidence-extraction",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -835,6 +835,15 @@ async function ensureSchema(env) {
       source_quality REAL DEFAULT 0, verification_status TEXT DEFAULT 'retrieved-public-source',
       fingerprint TEXT, retrieved_at TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`,
+    `CREATE TABLE IF NOT EXISTS transaction_evidence_extractions (
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, plan_id TEXT NOT NULL, question_id TEXT NOT NULL,
+      objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, source_evidence_ids TEXT NOT NULL,
+      buyer_name TEXT, purchased_scope TEXT, procurement_identifier TEXT, procurement_mechanism TEXT,
+      publication_date TEXT, close_date TEXT, award_date TEXT, contract_value TEXT, supplier_name TEXT,
+      delivery_geography TEXT, qualification_requirements TEXT, duration_recurrence TEXT,
+      missing_fields TEXT, field_provenance_json TEXT NOT NULL, extraction_status TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP, last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
     `CREATE TABLE IF NOT EXISTS mission_research_branches (
       id TEXT PRIMARY KEY, run_id TEXT NOT NULL, parent_question_id TEXT NOT NULL, objective_id TEXT NOT NULL,
       venture_id TEXT NOT NULL, question TEXT NOT NULL, rationale TEXT, priority INTEGER DEFAULT 3,
@@ -886,6 +895,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.5-001','1.8.5','Research specialist reliability: robust JSON parsing, schema validation, diagnostics, and bounded evidence-gap branching')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.7-001','1.8.7','Compute budget governor with conservative neuron accounting, throttling, and fail-closed AI authority')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.8-001','1.8.8','Opportunity qualification evidence contract: fail-closed graduation gate, explicit commercial dimensions, recursive evidence-gap research, and no Founder package on weak intelligence')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.20-001','1.8.20','Transaction evidence extraction: field-level provenance, fail-closed transaction qualification, and gap-directed follow-up research')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -5162,9 +5172,104 @@ async function researchDependencyGate(env,planId,qrow){
   return {allowed:missing.length===0,dimension:dim,missing,state};
 }
 
+const TRANSACTION_EXTRACTION_SYSTEM=`
+You are the VIS Transaction Evidence Extractor. Extract ONE observable purchasing transaction using ONLY supplied source material.
+Return one JSON object only. Never infer a missing fact. Use null for unsupported fields.
+Schema:
+{
+  "buyer_name": {"value": null, "evidence_indexes": []},
+  "purchased_scope": {"value": null, "evidence_indexes": []},
+  "procurement_identifier": {"value": null, "evidence_indexes": []},
+  "procurement_mechanism": {"value": null, "evidence_indexes": []},
+  "publication_date": {"value": null, "evidence_indexes": []},
+  "close_date": {"value": null, "evidence_indexes": []},
+  "award_date": {"value": null, "evidence_indexes": []},
+  "contract_value": {"value": null, "evidence_indexes": []},
+  "supplier_name": {"value": null, "evidence_indexes": []},
+  "delivery_geography": {"value": null, "evidence_indexes": []},
+  "qualification_requirements": {"value": null, "evidence_indexes": []},
+  "duration_recurrence": {"value": null, "evidence_indexes": []}
+}
+Rules:
+- Every non-null value requires at least one valid evidence index that directly supports that exact field.
+- buyer_name must be a named purchasing organization, not a sector or inferred buyer class.
+- purchased_scope must describe the concrete goods/services being purchased, not merely "services", "construction", or another broad category unless that is literally all the source establishes; broad-only scope does not qualify the transaction.
+- procurement_identifier is a tender/RFP/RFQ/contract/award/opportunity identifier when explicitly present.
+- procurement_mechanism is an explicitly evidenced mechanism such as open tender, RFP, RFQ, standing offer, direct award, or public tender opportunity. Do not infer it from the website name alone.
+- A search-results page, portal shell, navigation text, or JavaScript-required placeholder does not establish transaction facts unless the actual transaction details are visible in supplied material.
+`;
+
+const TRANSACTION_FIELDS=['buyer_name','purchased_scope','procurement_identifier','procurement_mechanism','publication_date','close_date','award_date','contract_value','supplier_name','delivery_geography','qualification_requirements','duration_recurrence'];
+
+function validateTransactionExtraction(raw,docCount){
+  const parsed=extractJSONObject(raw);
+  if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)) throw new Error('Transaction extraction is not a JSON object.');
+  const out={};
+  for(const field of TRANSACTION_FIELDS){
+    const item=parsed[field];
+    if(!item||typeof item!=='object'||Array.isArray(item)) throw new Error(`Transaction field ${field} missing object wrapper.`);
+    const value=item.value===null||item.value===undefined||String(item.value).trim()===''?null:cleanText(String(item.value),1600);
+    if(!Array.isArray(item.evidence_indexes)) throw new Error(`Transaction field ${field} evidence_indexes must be an array.`);
+    const indexes=[...new Set(item.evidence_indexes.map(Number))];
+    if(indexes.some(i=>!Number.isInteger(i)||i<0||i>=docCount)) throw new Error(`Transaction field ${field} referenced invalid evidence index.`);
+    if(value&&!indexes.length) throw new Error(`Transaction field ${field} has a value without provenance.`);
+    out[field]={value,evidence_indexes:indexes.slice(0,4)};
+  }
+  return out;
+}
+
+function transactionScopeIsConcrete(value){
+  const v=String(value||'').trim().toLowerCase();
+  if(!v||v.length<12) return false;
+  return !['construction services','professional services','maintenance services','inspection services','equipment supply','goods','services','construction'].includes(v);
+}
+
+async function extractAndPersistTransactionEvidence(env,{runId,planId,qrow,docs}){
+  const material=docs.map((d,i)=>`[${i}] ${d.name} | ${d.url}\n${d.text.slice(0,6000)}`).join('\n\n');
+  let raw='', parsed=null;
+  try{
+    raw=await think(env,TRANSACTION_EXTRACTION_SYSTEM,`TRANSACTION DISCOVERY QUESTION: ${qrow.question}\nAVAILABLE_EVIDENCE_INDEXES: [${docs.map((_,i)=>i).join(',')}]\nSOURCE MATERIAL:\n${material}\nReturn JSON only.`,1800,.05);
+    parsed=validateTransactionExtraction(raw,docs.length);
+  }catch(error){
+    try{ await audit(env,'JANITOR','TRANSACTION_EXTRACTION_FAILED',qrow.objective_id,JSON.stringify({objectiveId:qrow.objective_id,questionId:qrow.id,error:cleanText(error?.message||String(error),1200),externalSpendUSD:0})); }catch(_){}
+    return {qualified:false,status:'extraction_failed',missingFields:['buyer_name','purchased_scope','procurement_identifier_or_mechanism'],id:null};
+  }
+  const evidenceByIndex={};
+  for(let i=0;i<docs.length;i++) evidenceByIndex[i]=await persistResearchEvidence(env,{runId,planId,qrow,doc:docs[i],text:docs[i].text,relevance:.9});
+  const provenance={};
+  for(const field of TRANSACTION_FIELDS) provenance[field]=(parsed[field].evidence_indexes||[]).map(i=>evidenceByIndex[i]).filter(Boolean);
+  const buyer=parsed.buyer_name.value;
+  const scope=parsed.purchased_scope.value;
+  const identifier=parsed.procurement_identifier.value;
+  const mechanism=parsed.procurement_mechanism.value;
+  const requiredMissing=[];
+  if(!buyer) requiredMissing.push('buyer_name');
+  if(!transactionScopeIsConcrete(scope)) requiredMissing.push('purchased_scope');
+  if(!identifier&&!mechanism) requiredMissing.push('procurement_identifier_or_mechanism');
+  const optionalMissing=TRANSACTION_FIELDS.filter(f=>!parsed[f].value);
+  const qualified=requiredMissing.length===0;
+  const id=`TXE-${crypto.randomUUID()}`;
+  const sourceEvidenceIds=[...new Set(Object.values(provenance).flat())];
+  await env.DB.prepare(`INSERT INTO transaction_evidence_extractions
+    (id,run_id,plan_id,question_id,objective_id,venture_id,source_evidence_ids,buyer_name,purchased_scope,procurement_identifier,procurement_mechanism,publication_date,close_date,award_date,contract_value,supplier_name,delivery_geography,qualification_requirements,duration_recurrence,missing_fields,field_provenance_json,extraction_status,last_updated)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+      id,runId,planId,qrow.id,qrow.objective_id,qrow.venture_id,JSON.stringify(sourceEvidenceIds),buyer,scope,identifier,mechanism,
+      parsed.publication_date.value,parsed.close_date.value,parsed.award_date.value,parsed.contract_value.value,parsed.supplier_name.value,
+      parsed.delivery_geography.value,parsed.qualification_requirements.value,parsed.duration_recurrence.value,
+      JSON.stringify([...new Set([...requiredMissing,...optionalMissing])]),JSON.stringify(provenance),qualified?'qualified':'research_required',nowISO()
+    ).run();
+  await audit(env,'ADAPTIVE_RESEARCH',qualified?'TRANSACTION_EVIDENCE_QUALIFIED':'TRANSACTION_EVIDENCE_GAPS',qrow.objective_id,JSON.stringify({objectiveId:qrow.objective_id,ventureId:qrow.venture_id,planId,questionId:qrow.id,transactionExtractionId:id,qualified,requiredMissing,sourceEvidenceIds,externalSpendUSD:0}));
+  return {qualified,status:qualified?'qualified':'research_required',missingFields:requiredMissing,id,buyer,scope,identifier,mechanism,sourceEvidenceIds};
+}
+
+async function latestQualifiedTransaction(env,planId){
+  return await env.DB.prepare(`SELECT * FROM transaction_evidence_extractions WHERE plan_id=? AND extraction_status='qualified' ORDER BY created_at DESC LIMIT 1`).bind(planId).first();
+}
+
 async function ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,ventureId}){
   const state=await getResearchDependencyState(env,planId);
-  if(state.ready.buyer) return {buyerReady:true,question:null,created:false};
+  const qualifiedTransaction=await latestQualifiedTransaction(env,planId);
+  if(qualifiedTransaction) return {buyerReady:true,question:null,created:false,transaction:qualifiedTransaction};
   const marker='Which current British Columbia public-sector purchasing transaction';
   // V1.8.19: D1-safe stage lookup. Avoid LIKE/GLOB entirely; a bound pattern on the
   // accumulated legacy question set triggered SQLITE "pattern too complex" in production.
@@ -5176,10 +5281,15 @@ async function ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,v
     const question=`Which current British Columbia public-sector purchasing transaction provides direct evidence of a named buyer organization, a concrete purchased scope, and an observable procurement mechanism? Search actual tenders, awards, purchase opportunities, or public contract records across multiple service and supply categories. Do not search for ${objectiveId} as a product, category, code, or budget item.`;
     await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,5,'open',?)`).bind(id,planId,objectiveId,ventureId,question,JSON.stringify(['procurement','municipal-procurement','customer-demand']),nowISO()).run();
     row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(id).first();
-    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.19',legacyQueueBypassed:true,externalSpendUSD:0}));
+    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.20',legacyQueueBypassed:true,externalSpendUSD:0}));
     return {buyerReady:false,question:row,created:true};
   }
-  if(row.status==='answered'&&row.evidence_refs&&row.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(row.answer_summary||''))) return {buyerReady:true,question:row,created:false};
+  if(row.status==='answered'&&row.evidence_refs&&row.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(row.answer_summary||''))){
+    const tx=await latestQualifiedTransaction(env,planId);
+    if(tx) return {buyerReady:true,question:row,created:false,transaction:tx};
+    await env.DB.prepare(`UPDATE mission_research_questions SET status='research_required',answer_summary=?,last_updated=? WHERE id=?`).bind('INSUFFICIENT: transaction candidate lacks field-level verified buyer + concrete purchased scope + procurement identifier/mechanism. Transaction extraction required.',nowISO(),row.id).run();
+    row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(row.id).first();
+  }
   if(!['open','research_required'].includes(row.status)){
     await env.DB.prepare(`UPDATE mission_research_questions SET status='open',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
     row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(row.id).first();
@@ -5244,8 +5354,24 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
     const refs=[];
     for(const idx of (Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[]).slice(0,4)){ const doc=docs[Number(idx)]; if(!doc) continue; const eid=await persistResearchEvidence(env,{runId,planId,qrow,doc,text:doc.text,relevance:Number(parsed.confidence||.5)}); if(!refs.includes(eid)) refs.push(eid); }
     evidenceCount+=(new Set(refs)).size;
-    const conf=Math.max(0,Math.min(1,Number(parsed.confidence||0))), status=conf>=.55&&refs.length?'answered':'research_required'; if(status==='answered') answered++;
-    await env.DB.prepare(`UPDATE mission_research_questions SET status=?,answer_summary=?,evidence_refs=?,last_updated=? WHERE id=?`).bind(status,cleanText(parsed.answer,5000),JSON.stringify(refs),nowISO(),qrow.id).run();
+    const conf=Math.max(0,Math.min(1,Number(parsed.confidence||0)));
+    const isTransactionStage=String(qrow.question||'').startsWith('Which current British Columbia public-sector purchasing transaction');
+    let transactionExtraction=null;
+    if(isTransactionStage && conf>=.55 && refs.length){
+      transactionExtraction=await extractAndPersistTransactionEvidence(env,{runId,planId,qrow,docs});
+      if(transactionExtraction && !transactionExtraction.qualified){
+        const txGapQuestions=[];
+        if(transactionExtraction.missingFields.includes('buyer_name')) txGapQuestions.push('Which named purchasing organization is explicitly identified in the transaction record, and what primary transaction document proves it?');
+        if(transactionExtraction.missingFields.includes('purchased_scope')) txGapQuestions.push('What exact goods, services, deliverables, or statement of work are explicitly purchased in this transaction record?');
+        if(transactionExtraction.missingFields.includes('procurement_identifier_or_mechanism')) txGapQuestions.push('What tender, RFP, RFQ, contract, award, or opportunity identifier or explicit procurement mechanism is shown for this transaction?');
+        parsed.follow_up_questions=[...txGapQuestions,...(parsed.follow_up_questions||[])].slice(0,2);
+      }
+    }
+    const status=conf>=.55&&refs.length&&(!isTransactionStage||transactionExtraction?.qualified)?'answered':'research_required'; if(status==='answered') answered++;
+    const answerSummary=isTransactionStage&&!transactionExtraction?.qualified
+      ?`INSUFFICIENT: transaction extraction did not establish verified buyer + concrete purchased scope + procurement identifier/mechanism. Missing: ${(transactionExtraction?.missingFields||['transaction_evidence']).join(', ')}.`
+      :cleanText(parsed.answer,5000);
+    await env.DB.prepare(`UPDATE mission_research_questions SET status=?,answer_summary=?,evidence_refs=?,last_updated=? WHERE id=?`).bind(status,answerSummary,JSON.stringify(refs),nowISO(),qrow.id).run();
     if(depth>=maxDepth) return;
     for(const fq0 of (Array.isArray(parsed.follow_up_questions)?parsed.follow_up_questions:[]).slice(0,2)){
       const fq=cleanText(fq0,1200);
@@ -5276,8 +5402,8 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
   const discoveryStage=await ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,ventureId});
   if(!discoveryStage.buyerReady){
     if(discoveryStage.question) await processRow(discoveryStage.question,0);
-    const postDiscovery=await getResearchDependencyState(env,planId);
-    if(!postDiscovery.ready.buyer){
+    const postDiscoveryTransaction=await latestQualifiedTransaction(env,planId);
+    if(!postDiscoveryTransaction){
       await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_HELD',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:discoveryStage.question?.id||null,buyerReady:false,legacyQueueBypassed:true,sourceFetchesUsed:budget.fetches,externalSpendUSD:0}));
     } else {
       await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_BUYER_ESTABLISHED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:discoveryStage.question?.id||null,buyerReady:true,externalSpendUSD:0}));
@@ -5312,7 +5438,8 @@ async function getMissionResearchEvidence(env,objectiveId){
   const sourceHealth=(await env.DB.prepare(`SELECT * FROM research_source_health ORDER BY source_id`).all()).results||[];
   const specialistDiagnostics=(await env.DB.prepare(`SELECT id,run_id,question_id,attempt,stage,status,error,raw_preview,parsed_json,created_at FROM research_specialist_diagnostics WHERE objective_id=? ORDER BY created_at`).bind(objectiveId).all()).results||[];
   const qualificationGates=(await env.DB.prepare(`SELECT id,objective_id,work_order_id,venture_id,synthesis_id,challenge_id,status,supported_dimensions,total_dimensions,critical_dimensions_supported,qualification_json,next_questions_json,created_at FROM opportunity_qualification_gates WHERE objective_id=? ORDER BY created_at`).bind(objectiveId).all()).results||[];
-  return {ok:true,run,questions,evidence,branches,attention,sourceHealth,specialistDiagnostics,qualificationGates};
+  const transactionExtractions=(await env.DB.prepare(`SELECT * FROM transaction_evidence_extractions WHERE objective_id=? ORDER BY created_at`).bind(objectiveId).all()).results||[];
+  return {ok:true,run,questions,evidence,branches,attention,sourceHealth,specialistDiagnostics,qualificationGates,transactionExtractions};
 }
 
 const EVIDENCE_CURATOR_SYSTEM=`
