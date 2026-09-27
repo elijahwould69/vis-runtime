@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.10-objective-watchdog-autonomous-resume",
+  version: "1.8.11-timestamp-safe-objective-recovery",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -2535,20 +2535,52 @@ async function recoverStaleRuntimeState(env) {
 
   await watchdogExperiments(env);
 
-  const staleObjective = await env.DB.prepare(`
-    SELECT id, work_order_id, last_updated
+  // V1.8.11: normalize mixed ISO/SQLite timestamps before comparing them.
+  // substr(...,1,19) strips fractional seconds/Z and replace() converts the
+  // ISO T separator to SQLite's canonical space-separated timestamp.
+  const staleCutoffExpr = `julianday('now') - (30.0 / 1440.0)`;
+  const objectiveTimeExpr = `julianday(replace(substr(COALESCE(last_updated, started_at, created_at),1,19),'T',' '))`;
+
+  const oldestRunningObjective = await env.DB.prepare(`
+    SELECT
+      id,
+      work_order_id,
+      last_updated,
+      started_at,
+      created_at,
+      ${objectiveTimeExpr} AS normalized_jd,
+      julianday('now') AS now_jd,
+      (${objectiveTimeExpr} <= ${staleCutoffExpr}) AS is_stale
     FROM operational_objectives
     WHERE status = 'running'
-      AND datetime(COALESCE(last_updated, started_at, created_at))
-          <= datetime('now', '-30 minutes')
-    ORDER BY priority DESC, created_at ASC
+    ORDER BY ${objectiveTimeExpr} ASC, priority DESC, created_at ASC
     LIMIT 1
   `).first();
+
+  const staleObjective =
+    oldestRunningObjective && Number(oldestRunningObjective.is_stale) === 1
+      ? oldestRunningObjective
+      : null;
 
   let operationalObjectiveRecovery = {
     detected: false,
     claimed: false,
     objectiveId: null,
+    diagnostics: {
+      oldestRunningObjectiveId: oldestRunningObjective?.id || null,
+      oldestRunningLastUpdated: oldestRunningObjective?.last_updated || null,
+      oldestRunningStartedAt: oldestRunningObjective?.started_at || null,
+      oldestRunningCreatedAt: oldestRunningObjective?.created_at || null,
+      normalizedJulianDay:
+        oldestRunningObjective?.normalized_jd ?? null,
+      nowJulianDay:
+        oldestRunningObjective?.now_jd ?? null,
+      staleByNormalizedClock:
+        oldestRunningObjective
+          ? Number(oldestRunningObjective.is_stale) === 1
+          : null,
+      staleThresholdMinutes: 30
+    },
     result: null
   };
 
@@ -2562,8 +2594,8 @@ async function recoverStaleRuntimeState(env) {
           last_updated = ?
       WHERE id = ?
         AND status = 'running'
-        AND datetime(COALESCE(last_updated, started_at, created_at))
-            <= datetime('now', '-30 minutes')
+        AND julianday(replace(substr(COALESCE(last_updated, started_at, created_at),1,19),'T',' '))
+            <= julianday('now') - (30.0 / 1440.0)
     `).bind(nowISO(), staleObjective.id).run();
 
     if ((claimed.meta?.changes || 0) === 1) {
@@ -5230,7 +5262,7 @@ async function continueOperationalQueue(env) {
     WHERE status='queued'
        OR (status='research_required' AND datetime(last_updated)<=datetime('now','-60 minutes'))
        OR (status='research_paused' AND datetime(last_updated)<=datetime('now','-60 minutes'))
-       OR (status='running' AND datetime(COALESCE(last_updated,started_at,created_at))<=datetime('now','-30 minutes'))
+       OR (status='running' AND julianday(replace(substr(COALESCE(last_updated,started_at,created_at),1,19),'T',' '))<=julianday('now')-(30.0/1440.0))
     ORDER BY priority DESC,created_at ASC
     LIMIT 1
   `).first();
