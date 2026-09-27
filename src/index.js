@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.25-mission-constraint-gate",
+  version: "1.8.26-constraint-aware-candidate-search",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -907,6 +907,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.23-001','1.8.23','Detail Evidence Bridge: canonical procurement detail records bypass broad-page specialist gating and feed transaction extraction directly; identity lock remains fail-closed')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.24-001','1.8.24','Canonical Procurement Record Filter: utility and navigation pages are rejected; fetched candidates must contain transaction-shaped content before entering evidence extraction; identity lock remains fail-closed')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.25-001','1.8.25','Mission Constraint Gate: transaction identity and mission fit are evaluated separately; geography and recency are optional user-selectable constraints rather than global defaults; mismatched records remain valid Hive evidence but cannot satisfy the mission')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.26-001','1.8.26','Constraint-Aware Candidate Search: canonical procurement candidates are evaluated independently; locked mismatches remain valid Hive evidence while the bounded research run continues through later candidates until a mission match is found or the candidate budget is exhausted')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -5122,9 +5123,12 @@ async function collectQuestionSources(env,qrow,budget){
       ['construction services','CONSTRUCTION'],
       ['professional services','PROFESSIONAL']
     ];
+    const discoveryConstraints=missionConstraintProfile(qrow.question||'');
+    const geographyTerm=discoveryConstraints.geography?` ${discoveryConstraints.geography}`:'';
     for(const [phrase,id] of lanes){
       if(budget.fetches>=budget.maxFetches) break;
-      await addSearch(`SRC-CANADABUYS-TXN-${id}`,'CanadaBuys — transaction scan',`https://canadabuys.canada.ca/en/tender-opportunities?current_tab=c&items_per_page=50&words=${encodeURIComponent(phrase)}`);
+      const constrainedPhrase=`${phrase}${geographyTerm}`.trim();
+      await addSearch(`SRC-CANADABUYS-TXN-${id}`,'CanadaBuys — transaction scan',`https://canadabuys.canada.ca/en/tender-opportunities?current_tab=c&items_per_page=50&words=${encodeURIComponent(constrainedPhrase)}`);
     }
     const details=[];
     for(const searchDoc of searchDocs){
@@ -5595,8 +5599,27 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
       const canonicalDocs=docs.filter(d=>transactionSourceIsCanonical(d?.url));
       try{ await audit(env,'ADAPTIVE_RESEARCH','DETAIL_EVIDENCE_BRIDGE',qrow.objective_id,JSON.stringify({objectiveId:qrow.objective_id,runId,questionId:qrow.id,totalDocs:docs.length,canonicalDocs:canonicalDocs.length,canonicalUrls:canonicalDocs.map(d=>d.url).slice(0,8),specialistConfidence:conf,specialistEvidenceIndexes:Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[],externalSpendUSD:0})); }catch(_){}
       if(canonicalDocs.length){
-        transactionExtraction=await extractAndPersistTransactionEvidence(env,{runId,planId,qrow,docs:canonicalDocs});
-        for(const eid of (transactionExtraction?.sourceEvidenceIds||[])) if(!refs.includes(eid)) refs.push(eid);
+        // V1.8.26 Constraint-Aware Candidate Search: evaluate each canonical record
+        // independently. This prevents field provenance from different transactions
+        // from being mixed into one identity decision. A real but mission-mismatched
+        // transaction stays locked and persisted as Hive evidence, while the bounded
+        // run continues to the next candidate. Stop only on a mission-qualified match
+        // or when the already-bounded canonical candidate set is exhausted.
+        const candidateResults=[];
+        for(let candidateIndex=0;candidateIndex<canonicalDocs.length;candidateIndex++){
+          const candidateDoc=canonicalDocs[candidateIndex];
+          const candidateResult=await extractAndPersistTransactionEvidence(env,{runId,planId,qrow,docs:[candidateDoc]});
+          candidateResults.push(candidateResult);
+          for(const eid of (candidateResult?.sourceEvidenceIds||[])) if(!refs.includes(eid)) refs.push(eid);
+          try{ await audit(env,'ADAPTIVE_RESEARCH','CONSTRAINT_AWARE_CANDIDATE_EVALUATED',qrow.objective_id,JSON.stringify({objectiveId:qrow.objective_id,runId,questionId:qrow.id,candidateIndex,candidateUrl:candidateDoc?.url||null,transactionExtractionId:candidateResult?.id||null,identityStatus:candidateResult?.identityStatus||'unresolved',missionFitStatus:candidateResult?.missionFitStatus||'unchecked',qualified:!!candidateResult?.qualified,missionMismatches:candidateResult?.missionMismatches||[],externalSpendUSD:0})); }catch(_){}
+          if(candidateResult?.qualified){ transactionExtraction=candidateResult; break; }
+        }
+        if(!transactionExtraction){
+          const lockedMismatch=[...candidateResults].reverse().find(r=>r?.identityStatus==='locked'&&r?.missionFitStatus==='mismatch');
+          const lockedOther=[...candidateResults].reverse().find(r=>r?.identityStatus==='locked');
+          transactionExtraction=lockedMismatch||lockedOther||candidateResults[candidateResults.length-1]||{qualified:false,status:'candidate_unresolved',missingFields:['transaction_identity'],id:null,sourceEvidenceIds:[]};
+        }
+        try{ await audit(env,'ADAPTIVE_RESEARCH','CONSTRAINT_AWARE_CANDIDATE_SEARCH_COMPLETE',qrow.objective_id,JSON.stringify({objectiveId:qrow.objective_id,runId,questionId:qrow.id,candidatesEvaluated:candidateResults.length,matched:!!transactionExtraction?.qualified,selectedExtractionId:transactionExtraction?.id||null,selectedIdentityStatus:transactionExtraction?.identityStatus||'unresolved',selectedMissionFitStatus:transactionExtraction?.missionFitStatus||'unchecked',externalSpendUSD:0})); }catch(_){}
       } else {
         transactionExtraction={qualified:false,status:'candidate_unresolved',missingFields:['transaction_identity'],id:null,sourceEvidenceIds:[]};
       }
