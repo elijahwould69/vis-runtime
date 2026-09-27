@@ -1,9 +1,27 @@
 const VIS = {
-  version: "1.8.6-quota-resilient-research",
+  version: "1.8.7-compute-budget-governor",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
   autonomousSpendLimitUSD: 0,
+
+  computeBudget: {
+    enabled: true,
+    aiPaidInferenceEnabled: true,
+    monthlyInfrastructureCeilingUSD: 20,
+    workersPaidBaseReserveUSD: 5,
+    variableAICeilingUSD: 15,
+    internalVariableHardStopUSD: 14.25,
+    warningRatio: 0.70,
+    throttleRatio: 0.85,
+    criticalRatio: 0.95,
+    freeNeuronsPerDay: 10000,
+    neuronPricePer1000USD: 0.011,
+    modelInputNeuronsPerMillionTokens: 4119,
+    modelOutputNeuronsPerMillionTokens: 34868,
+    accountingMode: "conservative-estimate-with-usage-reconciliation",
+    scope: "Cloudflare Workers base plan plus Workers AI only"
+  },
 
   channels: {
     engineering: "C0C5FSR3JTS",
@@ -407,6 +425,26 @@ async function ensureSchema(env) {
       approved INTEGER DEFAULT 0,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS ai_compute_ledger (
+      id TEXT PRIMARY KEY,
+      reservation_id TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_tokens INTEGER DEFAULT 0,
+      output_tokens INTEGER DEFAULT 0,
+      estimated_neurons REAL DEFAULT 0,
+      day_key TEXT NOT NULL,
+      month_key TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_ai_compute_month
+    ON ai_compute_ledger(month_key, day_key)
   `).run();
 
   await env.DB.prepare(`
@@ -836,6 +874,7 @@ async function ensureSchema(env) {
   ]) { try { await env.DB.prepare(sql).run(); } catch (_) {} }
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.4-001','1.8.4','Adaptive research recursion, source health, attention budgets, and evidence gates')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.5-001','1.8.5','Research specialist reliability: robust JSON parsing, schema validation, diagnostics, and bounded evidence-gap branching')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.7-001','1.8.7','Compute budget governor with conservative neuron accounting, throttling, and fail-closed AI authority')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -1374,6 +1413,58 @@ function classifyAIProviderError(error) {
   return {kind:'ai_transient_or_unknown',retryable:true,message};
 }
 
+function utcBudgetKeys(d=new Date()) {
+  const iso=d.toISOString();
+  return {dayKey:iso.slice(0,10),monthKey:iso.slice(0,7)};
+}
+
+function approximateTokens(text) {
+  return Math.max(1,Math.ceil(String(text||'').length/4));
+}
+
+function neuronsForTokens(inputTokens,outputTokens) {
+  const b=VIS.computeBudget;
+  return (Number(inputTokens||0)*b.modelInputNeuronsPerMillionTokens/1e6)+(Number(outputTokens||0)*b.modelOutputNeuronsPerMillionTokens/1e6);
+}
+
+async function computeBudgetState(env, extraReservation=null) {
+  const b=VIS.computeBudget, {monthKey}=utcBudgetKeys();
+  const rows=await env.DB.prepare(`SELECT day_key, SUM(CASE WHEN phase='reserve' THEN estimated_neurons ELSE 0 END) reserved, SUM(CASE WHEN phase='reconcile' THEN estimated_neurons ELSE 0 END) reconciled FROM ai_compute_ledger WHERE month_key=? GROUP BY day_key`).bind(monthKey).all();
+  const byDay=new Map();
+  for(const r of (rows.results||[])) byDay.set(r.day_key,{reserved:Number(r.reserved||0),reconciled:Number(r.reconciled||0)});
+  if(extraReservation){ const x=byDay.get(extraReservation.dayKey)||{reserved:0,reconciled:0}; x.reserved+=Number(extraReservation.neurons||0); byDay.set(extraReservation.dayKey,x); }
+  let paidNeurons=0,totalNeurons=0;
+  for(const x of byDay.values()){ const n=Math.max(x.reserved,x.reconciled); totalNeurons+=n; paidNeurons+=Math.max(0,n-b.freeNeuronsPerDay); }
+  const variableUSD=paidNeurons/1000*b.neuronPricePer1000USD;
+  const totalInfrastructureUSD=b.workersPaidBaseReserveUSD+variableUSD;
+  const ratio=variableUSD/b.variableAICeilingUSD;
+  const mode=variableUSD>=b.internalVariableHardStopUSD?'hard_stop':ratio>=b.criticalRatio?'critical':ratio>=b.throttleRatio?'throttle':ratio>=b.warningRatio?'warning':'normal';
+  return {enabled:b.enabled,aiPaidInferenceEnabled:b.aiPaidInferenceEnabled,monthKey,totalEstimatedNeurons:Math.round(totalNeurons),estimatedPaidNeurons:Math.round(paidNeurons),estimatedVariableAIUSD:Number(variableUSD.toFixed(6)),reservedWorkersBaseUSD:b.workersPaidBaseReserveUSD,estimatedInfrastructureUSD:Number(totalInfrastructureUSD.toFixed(6)),monthlyInfrastructureCeilingUSD:b.monthlyInfrastructureCeilingUSD,variableAICeilingUSD:b.variableAICeilingUSD,internalVariableHardStopUSD:b.internalVariableHardStopUSD,remainingToInternalStopUSD:Number(Math.max(0,b.internalVariableHardStopUSD-variableUSD).toFixed(6)),mode,accountingMode:b.accountingMode,scope:b.scope};
+}
+
+async function reserveAICompute(env,systemPrompt,userPrompt,maxTokens) {
+  if(!VIS.computeBudget.enabled||!VIS.computeBudget.aiPaidInferenceEnabled) { const e=new Error('AI paid inference authority disabled by compute governor.'); e.providerState='compute_budget_disabled'; throw e; }
+  const inputTokens=approximateTokens(`${systemPrompt}\n${userPrompt}`);
+  const outputTokens=Math.max(1,Number(maxTokens||1000));
+  const neurons=neuronsForTokens(inputTokens,outputTokens);
+  const {dayKey,monthKey}=utcBudgetKeys();
+  const projected=await computeBudgetState(env,{dayKey,neurons});
+  if(projected.estimatedVariableAIUSD>VIS.computeBudget.internalVariableHardStopUSD){ const e=new Error(`VIS compute budget hard stop: projected variable AI spend $${projected.estimatedVariableAIUSD.toFixed(4)} exceeds internal stop $${VIS.computeBudget.internalVariableHardStopUSD.toFixed(2)}.`); e.providerState='compute_budget_exhausted'; throw e; }
+  if(projected.mode==='critical' && outputTokens>1200){ const e=new Error('VIS compute budget critical mode: high-token inference deferred.'); e.providerState='compute_budget_throttled'; throw e; }
+  if(projected.mode==='throttle' && outputTokens>1800){ const e=new Error('VIS compute budget throttle mode: high-token inference deferred.'); e.providerState='compute_budget_throttled'; throw e; }
+  const reservationId=`AIC-${crypto.randomUUID()}`;
+  await env.DB.prepare(`INSERT INTO ai_compute_ledger (id,reservation_id,phase,model,input_tokens,output_tokens,estimated_neurons,day_key,month_key) VALUES (?,?,?,?,?,?,?,?,?)`).bind(`${reservationId}-R`,reservationId,'reserve',VIS.model,inputTokens,outputTokens,neurons,dayKey,monthKey).run();
+  return {reservationId,inputTokens,outputTokens,neurons,dayKey,monthKey};
+}
+
+async function reconcileAICompute(env,reservation,result,text) {
+  const usage=result?.usage||result?.result?.usage||{};
+  const inputTokens=Number(usage.input_tokens||usage.prompt_tokens||reservation.inputTokens||0);
+  const outputTokens=Number(usage.output_tokens||usage.completion_tokens||approximateTokens(text));
+  const neurons=neuronsForTokens(inputTokens,outputTokens);
+  await env.DB.prepare(`INSERT INTO ai_compute_ledger (id,reservation_id,phase,model,input_tokens,output_tokens,estimated_neurons,day_key,month_key) VALUES (?,?,?,?,?,?,?,?,?)`).bind(`${reservation.reservationId}-C`,reservation.reservationId,'reconcile',VIS.model,inputTokens,outputTokens,neurons,reservation.dayKey,reservation.monthKey).run();
+}
+
 async function think(
   env,
   systemPrompt,
@@ -1382,24 +1473,19 @@ async function think(
   temperature = 0.4
 ) {
   if (!env.AI) throw new Error("Workers AI binding unavailable.");
+  await ensureSchema(env);
+  const reservation=await reserveAICompute(env,systemPrompt,userPrompt,maxTokens);
   const errors=[];
   for(let attempt=1;attempt<=3;attempt++){
     try {
-      const result=await env.AI.run(VIS.model,{
-        messages:[{role:"system",content:systemPrompt},{role:"user",content:userPrompt}],
-        max_tokens:maxTokens, temperature
-      });
+      const result=await env.AI.run(VIS.model,{messages:[{role:"system",content:systemPrompt},{role:"user",content:userPrompt}],max_tokens:maxTokens,temperature});
       const text=cleanText(extractAIText(result),14000);
-      if(text) return text;
+      if(text){ await reconcileAICompute(env,reservation,result,text); return text; }
       errors.push(`attempt ${attempt}: no readable response`);
     } catch(error) {
       const provider=classifyAIProviderError(error);
       errors.push(`attempt ${attempt} [${provider.kind}]: ${provider.message}`);
-      if(!provider.retryable) {
-        const terminal=new Error(`Workers AI terminal provider state: ${provider.kind}: ${provider.message}`);
-        terminal.providerState=provider.kind;
-        throw terminal;
-      }
+      if(!provider.retryable) { const terminal=new Error(`Workers AI terminal provider state: ${provider.kind}: ${provider.message}`); terminal.providerState=provider.kind; throw terminal; }
     }
     if(attempt<3) await new Promise(r=>setTimeout(r,250*attempt));
   }
@@ -3600,6 +3686,9 @@ async function getStatus(env) {
     autonomousExternalSpendLimitUSD:
       0,
 
+    computeBudget:
+      await computeBudgetState(env),
+
     unresolvedFailures:
       Number(
         failures?.count || 0
@@ -5064,6 +5153,11 @@ export default {
           return json(
             await getStatus(env)
           );
+        }
+
+        if (url.pathname === "/admin/compute-budget") {
+          await ensureSchema(env);
+          return json(await computeBudgetState(env));
         }
 
         if (
