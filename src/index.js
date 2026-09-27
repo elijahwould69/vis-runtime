@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.29-institutional-learning-retrieval-reuse",
+  version: "1.8.30-memory-quality-consolidation",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -911,6 +911,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.27-001','1.8.27','Mission Completion Propagation: a qualified mission-matched transaction propagates terminal success to the parent research plan and operational objective; residual unanswered research is retained as non-blocking Hive learning')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.28-001','1.8.28','Objective Lifecycle and Learning Closure: terminal objectives transition to completed lifecycle state; residual learning is detached into Hive knowledge; completed objectives are permanently excluded from continuation')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.29-001','1.8.29','Institutional Learning Retrieval and Reuse: new missions retrieve relevant active Hive knowledge with provenance, venture-boundary classification, and bounded reuse packets before research planning')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.30-001','1.8.30','Memory Quality and Consolidation: exclude self-memory, rank by evidence value and recency, penalize redundant objective echoes, diversify memory packets, and preserve provenance and venture boundaries')`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mission_knowledge_retrievals (
     id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, knowledge_id TEXT NOT NULL,
     relevance REAL DEFAULT 0, boundary_class TEXT NOT NULL, reuse_disposition TEXT NOT NULL,
@@ -4809,7 +4810,7 @@ For opportunity-discovery missions, the program must seek evidence for these com
 
 function learningTokens(text){
   const stop=new Set(['the','and','for','with','that','this','from','into','one','are','was','were','will','should','could','would','have','has','had','not','but','its','our','your','their','they','them','then','than','when','where','what','which','who','how','why','mission','objective','research','find','current','using','used','use','zero','dollar','internal']);
-  return [...new Set(String(text||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').split(/\s+/).filter(x=>x.length>=3&&!stop.has(x)))].slice(0,80);
+  return [...new Set(String(text||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').split(/\s+/).filter(x=>x.length>=3&&!stop.has(x)))].slice(0,100);
 }
 
 function knowledgeVentureBoundary(row,ventureId){
@@ -4820,35 +4821,101 @@ function knowledgeVentureBoundary(row,ventureId){
   return tagged===ventureId?'same-venture':'cross-venture';
 }
 
+function memoryTypeWeight(row){
+  const type=String(row?.knowledge_type||'').toLowerCase();
+  const verification=String(row?.verification_status||'').toLowerCase();
+  let weight=0;
+  if(type==='mission-completion') weight+=0.32;
+  else if(type.includes('evidence')||type.includes('finding')||type.includes('lesson')||type.includes('procedure')||type.includes('failure')) weight+=0.24;
+  else if(type==='residual-learning-question') weight+=0.10;
+  else if(type==='founder-objective') weight-=0.22;
+  if(verification==='terminal-condition-satisfied') weight+=0.18;
+  else if(verification.includes('verified')||verification.includes('validated')) weight+=0.12;
+  else if(verification==='open-learning-question') weight-=0.02;
+  return weight;
+}
+
+function memoryRecencyWeight(createdAt){
+  const ts=Date.parse(String(createdAt||''));
+  if(!Number.isFinite(ts)) return 0;
+  const ageDays=Math.max(0,(Date.now()-ts)/86400000);
+  if(ageDays<=7) return 0.10;
+  if(ageDays<=30) return 0.07;
+  if(ageDays<=180) return 0.04;
+  if(ageDays<=365) return 0.02;
+  return 0;
+}
+
+function memorySignature(row){
+  const type=String(row?.knowledge_type||'unknown').toLowerCase();
+  const tokens=learningTokens(`${row?.subject||''} ${row?.content||''}`).slice(0,14).sort();
+  return `${type}|${tokens.join(':')}`;
+}
+
+function tokenSimilarity(a,b){
+  const A=new Set(a||[]), B=new Set(b||[]);
+  if(!A.size||!B.size) return 0;
+  let intersection=0;
+  for(const x of A) if(B.has(x)) intersection++;
+  return intersection/Math.max(1,Math.min(A.size,B.size));
+}
+
 async function retrieveInstitutionalLearning(env,{objectiveId,ventureId,objective}){
   const rows=await env.DB.prepare(`SELECT id,knowledge_type,subject,content,confidence,verification_status,source_type,source_ref,created_at
-    FROM hive_knowledge WHERE status='active' ORDER BY confidence DESC,created_at DESC LIMIT 250`).all();
+    FROM hive_knowledge
+    WHERE status='active'
+      AND COALESCE(source_ref,'')<>?
+      AND lower(COALESCE(subject,''))<>lower(?)
+    ORDER BY confidence DESC,created_at DESC LIMIT 300`)
+    .bind(objectiveId,`Operational objective ${objectiveId}`).all();
+
   const missionTokens=learningTokens(objective);
   const scored=[];
   for(const row of (rows.results||[])){
     const hay=learningTokens(`${row.subject||''} ${row.content||''}`);
     const hs=new Set(hay);
     const overlap=missionTokens.filter(t=>hs.has(t));
-    let relevance=missionTokens.length?overlap.length/Math.min(missionTokens.length,20):0;
-    if(row.knowledge_type==='mission-completion') relevance+=0.08;
-    if(row.verification_status==='terminal-condition-satisfied') relevance+=0.08;
+    const lexical=missionTokens.length?overlap.length/Math.min(missionTokens.length,24):0;
+    const evidenceValue=memoryTypeWeight(row);
+    const recency=memoryRecencyWeight(row.created_at);
+    const confidence=Math.max(0,Math.min(1,Number(row.confidence||0)))*0.08;
     const boundary=knowledgeVentureBoundary(row,ventureId);
+    const boundaryAdjustment=boundary==='same-venture'?0.08:(boundary==='cross-venture'?-0.06:0);
     const disposition=boundary==='cross-venture'?'context-only':'reusable';
-    if(relevance<0.08) continue;
-    scored.push({row,relevance:Math.min(1,relevance),boundary,disposition,overlap});
+    const score=lexical+evidenceValue+recency+confidence+boundaryAdjustment;
+    if(score<0.10) continue;
+    scored.push({row,relevance:Math.max(0,Math.min(1,score)),boundary,disposition,overlap,tokens:hay,signature:memorySignature(row),
+      components:{lexical,evidenceValue,recency,confidence,boundaryAdjustment}});
   }
+
   scored.sort((a,b)=>b.relevance-a.relevance||Number(b.row.confidence||0)-Number(a.row.confidence||0));
-  const selected=scored.slice(0,12);
+
+  const selected=[];
+  const signatureCounts=new Map();
+  for(const candidate of scored){
+    if(selected.length>=12) break;
+    const sigCount=signatureCounts.get(candidate.signature)||0;
+    if(sigCount>=1 && String(candidate.row.knowledge_type||'')==='founder-objective') continue;
+    const nearDuplicate=selected.some(x=>tokenSimilarity(x.tokens,candidate.tokens)>=0.86 &&
+      String(x.row.knowledge_type||'')===String(candidate.row.knowledge_type||''));
+    if(nearDuplicate) continue;
+    selected.push(candidate);
+    signatureCounts.set(candidate.signature,sigCount+1);
+  }
+
   for(const x of selected){
     await env.DB.prepare(`INSERT INTO mission_knowledge_retrievals
       (id,objective_id,venture_id,knowledge_id,relevance,boundary_class,reuse_disposition,rationale)
       VALUES (?,?,?,?,?,?,?,?)`).bind(`MKR-${crypto.randomUUID()}`,objectiveId,ventureId,x.row.id,x.relevance,x.boundary,x.disposition,
-        cleanText(`Token overlap: ${x.overlap.slice(0,12).join(', ')||'semantic mission context'}; boundary=${x.boundary}. Cross-venture knowledge is context only and must not substitute for venture-specific evidence.`,2000)).run();
+        cleanText(`Memory quality score=${x.relevance.toFixed(3)}; lexical=${x.components.lexical.toFixed(3)}; evidenceValue=${x.components.evidenceValue.toFixed(3)}; recency=${x.components.recency.toFixed(3)}; confidence=${x.components.confidence.toFixed(3)}; boundary=${x.boundary}; overlap=${x.overlap.slice(0,10).join(', ')||'semantic mission context'}. Current-objective self-memory is excluded; redundant objective echoes are suppressed; cross-venture knowledge is context only and never substitutes for venture-specific evidence.`,2000)).run();
   }
-  await audit(env,'HIVE_MEMORY','INSTITUTIONAL_LEARNING_RETRIEVED',objectiveId,JSON.stringify({
-    objectiveId,ventureId,candidatesConsidered:(rows.results||[]).length,selected:selected.length,
-    knowledgeIds:selected.map(x=>x.row.id),boundaryClasses:selected.map(x=>x.boundary),
-    externalSpendUSD:0
+
+  await audit(env,'HIVE_MEMORY','MEMORY_QUALITY_PACKET_SELECTED',objectiveId,JSON.stringify({
+    objectiveId,ventureId,candidatesConsidered:(rows.results||[]).length,qualifiedCandidates:scored.length,
+    selected:selected.length,knowledgeIds:selected.map(x=>x.row.id),
+    knowledgeTypes:selected.map(x=>x.row.knowledge_type),
+    boundaryClasses:selected.map(x=>x.boundary),
+    selfMemoryExcluded:true,redundancySuppression:true,externalSpendUSD:0
   }));
   return selected;
 }
@@ -4856,7 +4923,7 @@ async function retrieveInstitutionalLearning(env,{objectiveId,ventureId,objectiv
 async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) {
   const venture=await env.DB.prepare(`SELECT * FROM ventures WHERE id=?`).bind(ventureId).first();
   const inherited=await retrieveInstitutionalLearning(env,{objectiveId,ventureId,objective});
-  const memoryPacket=inherited.map((x,i)=>`[${i}] ${x.row.id} | ${x.row.knowledge_type} | boundary=${x.boundary} | disposition=${x.disposition} | confidence=${x.row.confidence}\nSUBJECT: ${x.row.subject}\nCONTENT: ${String(x.row.content||'').slice(0,1800)}`).join('\n\n');
+  const memoryPacket=inherited.map((x,i)=>`[${i}] ${x.row.id} | ${x.row.knowledge_type} | quality=${x.relevance.toFixed(3)} | boundary=${x.boundary} | disposition=${x.disposition} | confidence=${x.row.confidence} | verification=${x.row.verification_status}\nSUBJECT: ${x.row.subject}\nCONTENT: ${String(x.row.content||'').slice(0,1800)}`).join('\n\n');
   const prompt=`VENTURE: ${venture?.name||ventureId}\nVENTURE CONTEXT: ${venture?.context||'No additional context.'}\nMISSION: ${objective}\n\nRELEVANT HIVE MEMORY:\n${memoryPacket||'No sufficiently relevant prior Hive knowledge retrieved.'}\n\nDesign mission-directed eyes-and-ears research before opportunity synthesis. Use relevant prior knowledge to identify what is already known and what remains uncertain. Never treat cross-venture context as proof for this venture. Never let prior memory override newer direct evidence. Research unresolved or stale claims rather than blindly repeating old work.`;
   let parsed=null;
   try {
@@ -4875,7 +4942,8 @@ async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) 
     retrievedKnowledgeIds:inherited.map(x=>x.row.id),
     retrievalCount:inherited.length,
     boundaryClasses:inherited.map(x=>({knowledgeId:x.row.id,boundary:x.boundary,disposition:x.disposition,relevance:x.relevance})),
-    rule:'Prior Hive memory guides research planning but never substitutes for current mission evidence.'
+    selectionPolicy:'quality-weighted-diverse-memory-v1',
+    rule:'Prior Hive memory guides research planning but never substitutes for current mission evidence. Self-memory and redundant objective echoes are excluded or suppressed; validated findings and mission completions are preferred over raw objective text.'
   };
   const id=`MRP-${crypto.randomUUID()}`;
   await env.DB.prepare(`INSERT INTO mission_research_plans (id,objective_id,venture_id,research_goal,plan_json,status,last_updated) VALUES (?,?,?,?,?,'active',?)`).bind(id,objectiveId,ventureId,cleanText(parsed.research_goal,2000),JSON.stringify(parsed),nowISO()).run();
