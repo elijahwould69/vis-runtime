@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.9-research-continuation-recovery",
+  version: "1.8.10-objective-watchdog-autonomous-resume",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -2519,7 +2519,7 @@ async function recoverStaleRuntimeState(env) {
         completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP),
         summary = COALESCE(
           summary,
-          'V1.7.2 recovery marked abandoned running rotation as failed.'
+          'Runtime watchdog marked abandoned running rotation as failed.'
         )
       WHERE status = 'running'
         AND datetime(started_at) <
@@ -2535,6 +2535,80 @@ async function recoverStaleRuntimeState(env) {
 
   await watchdogExperiments(env);
 
+  const staleObjective = await env.DB.prepare(`
+    SELECT id, work_order_id, last_updated
+    FROM operational_objectives
+    WHERE status = 'running'
+      AND datetime(COALESCE(last_updated, started_at, created_at))
+          <= datetime('now', '-30 minutes')
+    ORDER BY priority DESC, created_at ASC
+    LIMIT 1
+  `).first();
+
+  let operationalObjectiveRecovery = {
+    detected: false,
+    claimed: false,
+    objectiveId: null,
+    result: null
+  };
+
+  if (staleObjective) {
+    operationalObjectiveRecovery.detected = true;
+    operationalObjectiveRecovery.objectiveId = staleObjective.id;
+
+    const claimed = await env.DB.prepare(`
+      UPDATE operational_objectives
+      SET status = 'queued',
+          last_updated = ?
+      WHERE id = ?
+        AND status = 'running'
+        AND datetime(COALESCE(last_updated, started_at, created_at))
+            <= datetime('now', '-30 minutes')
+    `).bind(nowISO(), staleObjective.id).run();
+
+    if ((claimed.meta?.changes || 0) === 1) {
+      operationalObjectiveRecovery.claimed = true;
+
+      await audit(
+        env,
+        "JANITOR",
+        "STALE_OPERATIONAL_OBJECTIVE_CLAIMED",
+        staleObjective.work_order_id || staleObjective.id,
+        JSON.stringify({
+          objectiveId: staleObjective.id,
+          previousLastUpdated: staleObjective.last_updated,
+          recovery: "atomic-requeue-and-autonomous-resume",
+          externalSpendUSD: 0
+        })
+      );
+
+      try {
+        operationalObjectiveRecovery.result =
+          await processOperationalObjective(env, staleObjective.id);
+      } catch (error) {
+        await recordFailure(
+          env,
+          staleObjective.work_order_id || staleObjective.id,
+          "stale-operational-objective-resume",
+          error
+        );
+
+        await env.DB.prepare(`
+          UPDATE operational_objectives
+          SET status = 'queued',
+              last_updated = ?
+          WHERE id = ?
+            AND status = 'running'
+        `).bind(nowISO(), staleObjective.id).run();
+
+        operationalObjectiveRecovery.result = {
+          ok: false,
+          error: cleanText(error?.message || String(error), 1000)
+        };
+      }
+    }
+  }
+
   await audit(
     env,
     "VIS_RUNTIME",
@@ -2544,7 +2618,8 @@ async function recoverStaleRuntimeState(env) {
       rotationsChanged:
         staleRotations.meta?.changes || 0,
       locksRemoved:
-        staleLocks.meta?.changes || 0
+        staleLocks.meta?.changes || 0,
+      operationalObjectiveRecovery
     })
   );
 
@@ -2555,6 +2630,7 @@ async function recoverStaleRuntimeState(env) {
       staleRotations.meta?.changes || 0,
     staleLocksRemoved:
       staleLocks.meta?.changes || 0,
+    operationalObjectiveRecovery,
     experimentWatchdogRun: true,
     externalSpendUSD: 0
   };
@@ -5148,7 +5224,16 @@ async function intakeOperationalObjective(env, request) {
 
 async function continueOperationalQueue(env) {
   await ensureSchema(env);
-  const next=await env.DB.prepare(`SELECT id FROM operational_objectives WHERE status='queued' OR (status='research_paused' AND datetime(last_updated)<=datetime('now','-60 minutes')) OR (status='running' AND datetime(last_updated)<=datetime('now','-30 minutes')) ORDER BY priority DESC,created_at ASC LIMIT 1`).first();
+  const next=await env.DB.prepare(`
+    SELECT id
+    FROM operational_objectives
+    WHERE status='queued'
+       OR (status='research_required' AND datetime(last_updated)<=datetime('now','-60 minutes'))
+       OR (status='research_paused' AND datetime(last_updated)<=datetime('now','-60 minutes'))
+       OR (status='running' AND datetime(COALESCE(last_updated,started_at,created_at))<=datetime('now','-30 minutes'))
+    ORDER BY priority DESC,created_at ASC
+    LIMIT 1
+  `).first();
   if(!next) return {ok:true,processed:false};
   return await processOperationalObjective(env,next.id);
 }
