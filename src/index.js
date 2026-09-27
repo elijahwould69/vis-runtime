@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.12-objective-lifecycle-queue-hygiene",
+  version: "1.8.13-evidence-convergence-engine",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -4812,10 +4812,13 @@ Required schema:
 }
 Rules:
 - confidence must be between 0 and 1.
-- evidence_indexes must contain only zero-based indexes that actually support the answer.
+- evidence_indexes must contain only zero-based indexes explicitly listed in AVAILABLE_EVIDENCE_INDEXES. Never invent an index.
 - gaps must be an array of concise strings.
-- follow_up_questions must contain 0-2 narrow, researchable questions and must not merely restate the parent question.
-- If evidence is insufficient, use confidence below 0.55 and still identify specific gaps and useful follow-up questions when possible.
+- follow_up_questions must contain 0-2 narrow, researchable questions and must not merely restate or broaden the parent question.
+- Prefer questions that resolve one of these commercial dimensions: specific buyer, painful problem, concrete offer, demonstrated demand, pricing/economics, competition/substitutes, operations, risk, learnability/advantage, route-to-market.
+- A follow-up should have high information gain: name the buyer class, transaction/procurement signal, price/economic input, or primary evidence needed.
+- Do not ask generic questions about broad industry outlook, general optimism, generic trends, or economy-wide conditions unless the parent question specifically requires them.
+- If evidence is insufficient, use confidence below 0.55 and identify the smallest specific evidence gap that would materially change qualification.
 `;
 
 function validateResearchSpecialistOutput(raw,docCount){
@@ -4851,18 +4854,63 @@ async function recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt
 }
 
 function deterministicEvidenceGapQuestions(qrow,docs,error=''){
-  const classes=(()=>{try{return JSON.parse(qrow.source_classes||'[]')}catch{return []}})();
+  const fallback=convergentFallbackQuestions(qrow,docs,error);
   const sourceNames=[...new Set((docs||[]).map(d=>d.name).filter(Boolean))].slice(0,3);
   const context=sourceNames.length?` Sources retrieved: ${sourceNames.join(', ')}.`:'';
-  const gap=cleanText(error||'Retrieved material did not yield a validated answer.',500);
-  const qs=[
-    `What specific official or primary-source evidence directly answers: ${cleanText(qrow.question,700)}?`,
-    `Which current dataset, procurement record, buyer document, or regulator source can resolve the missing evidence for: ${cleanText(qrow.question,650)}?`
-  ];
-  if(classes.includes('procurement')||classes.includes('municipal-procurement')) qs[1]=`Which current official procurement notices or awarded-contract records directly address: ${cleanText(qrow.question,650)}?`;
-  else if(classes.includes('labour')) qs[1]=`Which current Statistics Canada or British Columbia labour dataset directly measures the workforce issue in: ${cleanText(qrow.question,650)}?`;
-  else if(classes.includes('official-statistics')) qs[1]=`Which current Statistics Canada or BC Stats table directly measures the market condition in: ${cleanText(qrow.question,650)}?`;
-  return {gap:`specialist-output-failure: ${gap}.${context}`,questions:qs};
+  return {
+    gap:`${fallback.gap}.${context}`,
+    questions:fallback.questions.filter(q=>commercialInformationGain(q,qrow.question)>=4).slice(0,2)
+  };
+}
+
+const COMMERCIAL_DIMENSIONS=[
+  'buyer','pain','offer','demand','competition','pricing_economics',
+  'operations','risks','learnability_advantage','route_to_market'
+];
+
+function classifyCommercialDimension(question=''){
+  const q=String(question||'').toLowerCase();
+  if(/\b(buyer|customer|purchas|budget|procurement|contracting authorit|decision maker)\b/.test(q)) return 'buyer';
+  if(/\b(pain|problem|shortage|delay|costly|urgent|bottleneck|failure|complaint)\b/.test(q)) return 'pain';
+  if(/\b(offer|service|product|solution|deliverable|scope)\b/.test(q)) return 'offer';
+  if(/\b(demand|tender|rfp|rfq|award|spend|volume|frequency|market need)\b/.test(q)) return 'demand';
+  if(/\b(competitor|substitute|alternative|incumbent)\b/.test(q)) return 'competition';
+  if(/\b(price|pricing|margin|economics|contract value|revenue|cost|gross profit|unit economics)\b/.test(q)) return 'pricing_economics';
+  if(/\b(operation|equipment|labour|labor|supplier|logistics|capacity|delivery)\b/.test(q)) return 'operations';
+  if(/\b(risk|regulat|licen|permit|insurance|liability|constraint)\b/.test(q)) return 'risks';
+  if(/\b(learn|advantage|capabilit|skill|moat|differentiat)\b/.test(q)) return 'learnability_advantage';
+  if(/\b(route.to.market|sales channel|go.to.market|reach buyer|distribution|bid process)\b/.test(q)) return 'route_to_market';
+  return 'unclassified';
+}
+
+function commercialInformationGain(question='',parentQuestion=''){
+  const q=String(question||'').toLowerCase();
+  const parent=String(parentQuestion||'').toLowerCase();
+  let score=classifyCommercialDimension(q)==='unclassified'?0:4;
+  if(/\b(specific|named|which|who|what current|how much|contract|award|tender|budget|price|margin|buyer)\b/.test(q)) score+=2;
+  if(/\b(primary|official|procurement|invoice|award|dataset|buyer document|price list)\b/.test(q)) score+=2;
+  if(/\b(general outlook|overall outlook|optimism|broad trend|industry-wide|economy-wide)\b/.test(q)) score-=5;
+  if(parent && q===parent) score-=5;
+  return score;
+}
+
+function convergentFallbackQuestions(qrow,docs,error=''){
+  const dim=classifyCommercialDimension(qrow.question);
+  const stem=cleanText(qrow.question,650);
+  const byDimension={
+    buyer:[`Which specific buyer organization or buyer class currently budgets for the need described in: ${stem}?`,`Which current procurement, budget, contract, or buyer document proves that buyer spends on this need?`],
+    pain:[`What current primary evidence quantifies the buyer's cost, delay, shortage, failure rate, or urgency for: ${stem}?`,`Which named buyer or industry body documents this problem and its operational consequence?`],
+    offer:[`What concrete deliverable could solve the evidenced buyer problem in: ${stem}?`,`What existing purchased service or product demonstrates the required scope and delivery standard?`],
+    demand:[`Which current tenders, awards, purchase records, or recurring buyer activity demonstrate demand for: ${stem}?`,`How frequently and at what observable volume are buyers purchasing this category?`],
+    competition:[`Which named suppliers or substitutes currently serve the buyer need in: ${stem}?`,`What do current competitor offers reveal about differentiation and buyer expectations?`],
+    pricing_economics:[`What current contract values, posted prices, wage/material inputs, or comparable transactions support economics for: ${stem}?`,`What evidence supports a plausible revenue, direct-cost, and gross-margin range for one transaction?`],
+    operations:[`What equipment, labour, supplier, certification, and delivery requirements are necessary to fulfill: ${stem}?`,`Which requirement is the hardest operational constraint and what primary source verifies it?`],
+    risks:[`Which specific regulatory, liability, procurement, supply, or execution risk could invalidate: ${stem}?`,`What official source establishes the highest-consequence constraint?`],
+    learnability_advantage:[`What capability must VIS or the venture learn to compete credibly in: ${stem}?`,`What evidence indicates that capability can be acquired without prohibitive capital, licensing, or lead time?`],
+    route_to_market:[`How does the identified buyer currently discover, qualify, and purchase suppliers for: ${stem}?`,`Which concrete channel, vendor list, tender portal, distributor, or direct-sales path reaches that buyer?`],
+    unclassified:[`Which specific buyer has a current painful problem that could become one concrete offer related to: ${stem}?`,`What current primary evidence establishes demand and pricing/economics for that buyer-problem-offer combination?`]
+  };
+  return {dimension:dim,gap:`commercial-evidence-gap: ${cleanText(error||'validated commercial evidence is incomplete',500)}`,questions:byDimension[dim]};
 }
 
 async function researchFingerprint(value){
@@ -4955,9 +5003,18 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
     let parsed=null, specialistError='', specialistRaw='';
     try{
       const material=docs.map((d,i)=>`[${i}] ${d.name} | ${d.url}\n${d.text.slice(0,5000)}`).join('\n\n');
-      specialistRaw=await think(env,RESEARCH_SPECIALIST_SYSTEM,`QUESTION: ${qrow.question}\nSOURCE MATERIAL:\n${material}\nReturn one JSON object only.`,1600,.1);
-      parsed=validateResearchSpecialistOutput(specialistRaw,docs.length);
-      await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'parse-and-validate',status:'validated',raw:specialistRaw,parsed});
+      const evidenceManifest=docs.map((_,i)=>i).join(',');
+      specialistRaw=await think(env,RESEARCH_SPECIALIST_SYSTEM,`QUESTION: ${qrow.question}\nAVAILABLE_EVIDENCE_INDEXES: [${evidenceManifest}]\nSOURCE MATERIAL:\n${material}\nReturn one JSON object only.`,1600,.1);
+      try {
+        parsed=validateResearchSpecialistOutput(specialistRaw,docs.length);
+        await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'parse-and-validate',status:'validated',raw:specialistRaw,parsed});
+      } catch(validationError) {
+        await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'parse-and-validate',status:'repair-requested',error:cleanText(validationError?.message||String(validationError),1200),raw:specialistRaw});
+        const repairedRaw=await think(env,RESEARCH_SPECIALIST_SYSTEM,`REPAIR THE PRIOR JSON ONLY. QUESTION: ${qrow.question}\nAVAILABLE_EVIDENCE_INDEXES: [${evidenceManifest}]\nVALIDATION ERROR: ${cleanText(validationError?.message||String(validationError),800)}\nPRIOR OUTPUT: ${cleanText(specialistRaw,5000)}\nReturn corrected JSON only. Do not add evidence not present in SOURCE MATERIAL.\nSOURCE MATERIAL:\n${material}`,1200,0);
+        specialistRaw=repairedRaw;
+        parsed=validateResearchSpecialistOutput(repairedRaw,docs.length);
+        await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:2,stage:'repair-and-validate',status:'validated',raw:repairedRaw,parsed});
+      }
     }catch(error){
       specialistError=cleanText(error?.stack||error?.message||String(error),3000);
       const provider=classifyAIProviderError(error);
@@ -4988,7 +5045,11 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
     await env.DB.prepare(`UPDATE mission_research_questions SET status=?,answer_summary=?,evidence_refs=?,last_updated=? WHERE id=?`).bind(status,cleanText(parsed.answer,5000),JSON.stringify(refs),nowISO(),qrow.id).run();
     if(depth>=maxDepth) return;
     for(const fq0 of (Array.isArray(parsed.follow_up_questions)?parsed.follow_up_questions:[]).slice(0,2)){
-      const fq=cleanText(fq0,1200); if(!fq||fq.length<15) continue; const fp=await branchFingerprint(fq);
+      const fq=cleanText(fq0,1200);
+      if(!fq||fq.length<15) continue;
+      const informationGain=commercialInformationGain(fq,qrow.question);
+      if(informationGain<4){ dupes++; continue; }
+      const fp=await branchFingerprint(`${classifyCommercialDimension(fq)}:${fq}`);
       const existing=await env.DB.prepare(`SELECT id FROM mission_research_branches WHERE objective_id=? AND fingerprint=? LIMIT 1`).bind(objectiveId,fp).first();
       if(existing){ dupes++; continue; }
       const bid=`MRB-${crypto.randomUUID()}`; await env.DB.prepare(`INSERT INTO mission_research_branches (id,run_id,parent_question_id,objective_id,venture_id,question,rationale,priority,status,depth,fingerprint) VALUES (?,?,?,?,?,?,?,?, 'queued',?,?)`).bind(bid,runId,qrow.id,objectiveId,ventureId,fq,`Generated from unresolved evidence gap in ${qrow.id}`,Math.max(1,researchPriority(qrow.priority)-1),depth+1,fp).run(); branches++;
@@ -5138,14 +5199,18 @@ async function qualifyOperationalOpportunity(env,{objectiveId,workOrderId,ventur
 
 async function enqueueQualificationResearchGaps(env,{planId,objectiveId,ventureId,questions}){
   let created=0;
-  for(const question0 of (questions||[]).slice(0,8)){
-    const question=cleanText(question0,1200); if(question.length<15) continue;
+  const ranked=[...(questions||[])]
+    .map(q=>({q:cleanText(q,1200),score:commercialInformationGain(q,'')}))
+    .filter(x=>x.q.length>=15&&x.score>=4)
+    .sort((a,b)=>b.score-a.score);
+  for(const item of ranked.slice(0,8)){
+    const question=item.q;
     const fp=await branchFingerprint(question);
     const existing=await env.DB.prepare(`SELECT id FROM mission_research_branches WHERE objective_id=? AND fingerprint=? LIMIT 1`).bind(objectiveId,fp).first();
     if(existing) continue;
     const bid=`MRB-${crypto.randomUUID()}`;
     await env.DB.prepare(`INSERT INTO mission_research_branches (id,run_id,parent_question_id,objective_id,venture_id,question,rationale,priority,status,depth,fingerprint) VALUES (?,NULL,NULL,?,?,?,?,?,'queued',1,?)`).bind(bid,objectiveId,ventureId,question,'Opportunity qualification evidence gap',5,fp).run();
-    await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,? ,5,'open',?)`).bind(`MRQ-${crypto.randomUUID()}`,planId,objectiveId,ventureId,question,JSON.stringify(['customer-demand','competitor-pricing','industry-market','procurement']),nowISO()).run();
+    await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,? ,5,'open',?)`).bind(`MRQ-${crypto.randomUUID()}`,planId,objectiveId,ventureId,question,JSON.stringify(['procurement','customer-demand','competitor-pricing','official-statistics']),nowISO()).run();
     created++;
   }
   return created;
