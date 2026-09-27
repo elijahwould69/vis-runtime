@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.27-mission-completion-propagation",
+  version: "1.8.28-objective-lifecycle-learning-closure",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -909,6 +909,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.25-001','1.8.25','Mission Constraint Gate: transaction identity and mission fit are evaluated separately; geography and recency are optional user-selectable constraints rather than global defaults; mismatched records remain valid Hive evidence but cannot satisfy the mission')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.26-001','1.8.26','Constraint-Aware Candidate Search: canonical procurement candidates are evaluated independently; locked mismatches remain valid Hive evidence while the bounded research run continues through later candidates until a mission match is found or the candidate budget is exhausted')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.27-001','1.8.27','Mission Completion Propagation: a qualified mission-matched transaction propagates terminal success to the parent research plan and operational objective; residual unanswered research is retained as non-blocking Hive learning')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.28-001','1.8.28','Objective Lifecycle and Learning Closure: terminal objectives transition to completed lifecycle state; residual learning is detached into Hive knowledge; completed objectives are permanently excluded from continuation')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -5531,7 +5532,36 @@ async function propagateMissionCompletion(env,{planId,objectiveId,workOrderId,ve
     WHERE id=?`).bind(nowISO(),`Mission terminal condition satisfied by qualified transaction ${tx.id}. Residual unanswered research retained as non-blocking Hive learning.`,researchRun.runId).run();
   await env.DB.prepare(`UPDATE mission_research_plans SET status='completed',last_updated=? WHERE id=?`).bind(nowISO(),planId).run();
   await env.DB.prepare(`UPDATE work_orders SET status='completed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),workOrderId).run();
-  await env.DB.prepare(`UPDATE operational_objectives SET status='completed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),objectiveId).run();
+  const residualRows=await env.DB.prepare(`SELECT id,question,priority,status FROM mission_research_questions WHERE plan_id=? AND status='retained_learning' ORDER BY priority DESC,id`).bind(planId).all();
+  const residualQuestions=residualRows.results||[];
+  const normalized=new Set();
+  let detachedLearningCount=0;
+  let duplicateLearningCount=0;
+  for(const q of residualQuestions){
+    const norm=String(q.question||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim().replace(/\s+/g,' ');
+    if(!norm || normalized.has(norm)){
+      duplicateLearningCount++;
+      await env.DB.prepare(`UPDATE mission_research_questions SET status='learning_duplicate',last_updated=? WHERE id=?`).bind(nowISO(),q.id).run();
+      continue;
+    }
+    normalized.add(norm);
+    await createHiveKnowledge(env,{
+      knowledgeType:'residual-learning-question',
+      subject:`Residual learning from ${objectiveId}: ${String(q.question||'').slice(0,160)}`,
+      content:JSON.stringify({sourceObjectiveId:objectiveId,sourcePlanId:planId,sourceQuestionId:q.id,ventureId,question:q.question,priority:q.priority,disposition:'detached-non-blocking-learning'}),
+      confidence:0.5,verificationStatus:'open-learning-question',sourceType:'adaptive-research',sourceRef:q.id
+    });
+    detachedLearningCount++;
+    await env.DB.prepare(`UPDATE mission_research_questions SET status='learning_detached',last_updated=? WHERE id=?`).bind(nowISO(),q.id).run();
+  }
+
+  await env.DB.prepare(`UPDATE operational_objectives
+    SET status='completed',lifecycle_state='completed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),objectiveId).run();
+
+  await audit(env,'HIVE_LIFECYCLE','OBJECTIVE_LIFECYCLE_CLOSED',objectiveId,JSON.stringify({
+    objectiveId,ventureId,planId,status:'completed',lifecycleState:'completed',
+    detachedLearningCount,duplicateLearningCount,continuationEligible:false,externalSpendUSD:0
+  }));
 
   await audit(env,'ADAPTIVE_RESEARCH','MISSION_TERMINAL_CONDITION_SATISFIED',objectiveId,JSON.stringify({
     objectiveId,ventureId,planId,runId:researchRun.runId,transactionExtractionId:tx.id,
@@ -6048,6 +6078,7 @@ async function continueOperationalQueue(env) {
     SET continuation_count=COALESCE(continuation_count,0)+1
     WHERE id=?
       AND COALESCE(lifecycle_state,'active')='active'
+      AND status NOT IN ('completed','retired','cancelled')
       AND COALESCE(continuation_count,0) < COALESCE(continuation_limit,8)
   `).bind(next.id).run();
   if((claimed.meta?.changes||0)!==1) return {ok:true,processed:false,reason:'queue-claim-lost'};
