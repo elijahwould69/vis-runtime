@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.14-research-plan-rebase",
+  version: "1.8.15-evidence-dependency-graph",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -5069,13 +5069,71 @@ async function ensureConvergedResearchPlan(env,{objectiveId,ventureId,objective,
   return {id:newPlanId,plan,rebase:true,oldPlanId:existingPlan.id};
 }
 
+const RESEARCH_DEPENDENCY_ORDER=['buyer','pain','offer','demand','pricing_economics','competition','operations','risks','route_to_market'];
+const RESEARCH_DEPENDENCY_PREREQS={
+  buyer:[],
+  pain:['buyer'],
+  offer:['buyer','pain'],
+  demand:['buyer','pain','offer'],
+  pricing_economics:['buyer','pain','offer'],
+  competition:['buyer','pain','offer'],
+  operations:['buyer','pain','offer'],
+  risks:['buyer','pain','offer'],
+  learnability_advantage:['buyer','pain','offer'],
+  route_to_market:['buyer','pain','offer']
+};
+
+function canonicalDependencyDimension(question=''){
+  const q=String(question||'').toLowerCase();
+  if(q.includes('which specific british columbia buyer organization or narrowly defined buyer class')) return 'buyer';
+  if(q.includes('what current primary evidence shows a costly, urgent, recurring problem for that specific buyer')) return 'pain';
+  if(q.includes('what concrete product or service could vis-backed operators deliver to solve that evidenced buyer problem')) return 'offer';
+  if(q.includes('which current tenders, awards, purchase records, budgets, or recurring transactions demonstrate demand')) return 'demand';
+  if(q.includes('what current contract values, posted prices, direct labour/material inputs, or comparable transactions support revenue')) return 'pricing_economics';
+  if(q.includes('which named competitors or substitutes currently serve this buyer')) return 'competition';
+  if(q.includes('what equipment, labour, supplier, certification, insurance, regulatory, and delivery requirements')) return 'operations';
+  if(q.includes('how does the specific buyer discover, qualify, approve, and purchase from suppliers')) return 'route_to_market';
+  return null;
+}
+
+async function getResearchDependencyState(env,planId){
+  const roots=(await env.DB.prepare(`SELECT id,question,status,evidence_refs,answer_summary FROM mission_research_questions WHERE plan_id=? ORDER BY created_at,id`).bind(planId).all()).results||[];
+  const canonical={};
+  for(const r of roots){ const d=canonicalDependencyDimension(r.question); if(d&&!canonical[d]) canonical[d]=r; }
+  const ready={};
+  for(const d of RESEARCH_DEPENDENCY_ORDER){
+    const r=canonical[d];
+    let ok=Boolean(r&&r.status==='answered'&&r.evidence_refs&&r.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(r.answer_summary||'')));
+    if(!ok&&r){
+      const child=await env.DB.prepare(`SELECT q.id FROM mission_research_branches b JOIN mission_research_questions q ON q.id=b.child_question_id WHERE b.parent_question_id=? AND q.status='answered' AND q.evidence_refs IS NOT NULL AND q.evidence_refs!='[]' AND COALESCE(q.answer_summary,'') NOT LIKE 'INSUFFICIENT%' ORDER BY q.last_updated DESC LIMIT 1`).bind(r.id).first();
+      ok=Boolean(child?.id);
+    }
+    ready[d]=ok;
+  }
+  return {canonical,ready};
+}
+
+async function researchDependencyGate(env,planId,qrow){
+  const state=await getResearchDependencyState(env,planId);
+  const dim=canonicalDependencyDimension(qrow.question)||classifyCommercialDimension(qrow.question);
+  const prereqs=RESEARCH_DEPENDENCY_PREREQS[dim]||[];
+  const missing=prereqs.filter(d=>!state.ready[d]);
+  return {allowed:missing.length===0,dimension:dim,missing,state};
+}
+
 async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuestions=8,maxDepth=2,maxTotalQuestions=16,maxSourceFetches=20}){
   const runId=`MRUN-${crypto.randomUUID()}`, attentionId=`RAL-${crypto.randomUUID()}`;
   await env.DB.prepare(`INSERT INTO mission_research_runs (id,plan_id,objective_id,venture_id,status) VALUES (?,?,?,?, 'running')`).bind(runId,planId,objectiveId,ventureId).run();
   await env.DB.prepare(`INSERT INTO research_attention_ledger (id,objective_id,plan_id,run_id,max_depth,max_questions,max_source_fetches) VALUES (?,?,?,?,?,?,?)`).bind(attentionId,objectiveId,planId,runId,maxDepth,maxTotalQuestions,maxSourceFetches).run();
-  const budget={fetches:0,maxFetches:Math.min(20,maxSourceFetches)}; let attempted=0,answered=0,evidenceCount=0,branches=0,dupes=0,providerState=null;
+  const budget={fetches:0,maxFetches:Math.min(20,maxSourceFetches)}; let attempted=0,answered=0,evidenceCount=0,branches=0,dupes=0,dependencyBlocked=0,providerState=null;
   const processRow=async(qrow,depth)=>{
     if(attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) return;
+    const dependency=await researchDependencyGate(env,planId,qrow);
+    if(!dependency.allowed){
+      dependencyBlocked++;
+      await env.DB.prepare(`UPDATE mission_research_questions SET status='open',answer_summary=?,last_updated=? WHERE id=?`).bind(`DEPENDENCY_BLOCKED: ${dependency.dimension} requires verified ${dependency.missing.join(' + ')} evidence first.`,nowISO(),qrow.id).run();
+      return;
+    }
     attempted++;
     const docs=await collectQuestionSources(env,qrow,budget);
     if(!docs.length){ await env.DB.prepare(`UPDATE mission_research_questions SET status='research_required',answer_summary=?,last_updated=? WHERE id=?`).bind('No configured public source returned usable material.',nowISO(),qrow.id).run(); return; }
@@ -5128,6 +5186,12 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
       if(!fq||fq.length<15) continue;
       const informationGain=commercialInformationGain(fq,qrow.question);
       if(informationGain<4){ dupes++; continue; }
+      const parentDim=canonicalDependencyDimension(qrow.question)||classifyCommercialDimension(qrow.question);
+      const followDim=classifyCommercialDimension(fq);
+      const depState=await getResearchDependencyState(env,planId);
+      if(parentDim==='buyer'&&!depState.ready.buyer&&followDim!=='buyer'){ dependencyBlocked++; continue; }
+      if(parentDim==='pain'&&!depState.ready.pain&&!['buyer','pain'].includes(followDim)){ dependencyBlocked++; continue; }
+      if(parentDim==='offer'&&!depState.ready.offer&&!['buyer','pain','offer'].includes(followDim)){ dependencyBlocked++; continue; }
       const fp=await branchFingerprint(`${classifyCommercialDimension(fq)}:${fq}`);
       const existing=await env.DB.prepare(`SELECT id FROM mission_research_branches WHERE objective_id=? AND fingerprint=? LIMIT 1`).bind(objectiveId,fp).first();
       if(existing){ dupes++; continue; }
@@ -5149,10 +5213,10 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
   const ratio=attempted?answered/attempted:0, sufficient=!providerState&&!continuationRequired&&answered>=2&&evidenceCount>=2&&ratio>=.20;
   const status=providerState|| (sufficient?'completed':'research_required');
   const stopReason=providerState|| (continuationRequired?'research-continuation-required':budget.fetches>=budget.maxFetches?'source-fetch-budget':attempted>=maxTotalQuestions?'question-budget':sufficient?'evidence-sufficient':'evidence-insufficient');
-  await env.DB.prepare(`UPDATE mission_research_runs SET status=?,questions_attempted=?,questions_answered=?,evidence_count=?,branches_created=?,completed_at=?,diagnostic=? WHERE id=?`).bind(status,attempted,answered,evidenceCount,branches,nowISO(),`Evidence gate: ${answered}/${attempted} answered; ${evidenceCount} evidence refs; ${budget.fetches} source fetches; stop=${stopReason}.`,runId).run();
+  await env.DB.prepare(`UPDATE mission_research_runs SET status=?,questions_attempted=?,questions_answered=?,evidence_count=?,branches_created=?,completed_at=?,diagnostic=? WHERE id=?`).bind(status,attempted,answered,evidenceCount,branches,nowISO(),`Evidence gate: ${answered}/${attempted} answered; ${evidenceCount} evidence refs; ${budget.fetches} source fetches; dependency-blocked=${dependencyBlocked}; stop=${stopReason}.`,runId).run();
   await env.DB.prepare(`UPDATE mission_research_plans SET status=?,last_updated=? WHERE id=?`).bind(status,nowISO(),planId).run();
   await env.DB.prepare(`UPDATE research_attention_ledger SET questions_used=?,source_fetches_used=?,duplicate_branches_suppressed=?,stop_reason=?,last_updated=? WHERE id=?`).bind(attempted,budget.fetches,dupes,stopReason,nowISO(),attentionId).run();
-  return {runId,status,evidenceSufficient:sufficient,continuationRequired,unresolvedQuestions,queuedBranches,providerState,questionsAttempted:attempted,questionsAnswered:answered,evidenceCount,branchesCreated:branches,sourceFetches:budget.fetches,duplicateBranchesSuppressed:dupes,stopReason,attentionId};
+  return {runId,status,evidenceSufficient:sufficient,continuationRequired,unresolvedQuestions,queuedBranches,providerState,questionsAttempted:attempted,questionsAnswered:answered,evidenceCount,branchesCreated:branches,sourceFetches:budget.fetches,duplicateBranchesSuppressed:dupes,dependencyBlocked,stopReason,attentionId};
 }
 
 async function getMissionResearchEvidence(env,objectiveId){
