@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.7-compute-budget-governor",
+  version: "1.8.8-opportunity-evidence-contract",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -854,6 +854,12 @@ async function ensureSchema(env) {
     `CREATE TABLE IF NOT EXISTS schema_migrations (
       id TEXT PRIMARY KEY, version TEXT NOT NULL, description TEXT NOT NULL, applied_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`,
+    `CREATE TABLE IF NOT EXISTS opportunity_qualification_gates (
+      id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, work_order_id TEXT NOT NULL, venture_id TEXT NOT NULL,
+      synthesis_id TEXT, challenge_id TEXT, status TEXT NOT NULL, supported_dimensions INTEGER DEFAULT 0,
+      total_dimensions INTEGER DEFAULT 10, critical_dimensions_supported INTEGER DEFAULT 0,
+      qualification_json TEXT NOT NULL, next_questions_json TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
     `CREATE TABLE IF NOT EXISTS research_specialist_diagnostics (
       id TEXT PRIMARY KEY, run_id TEXT NOT NULL, plan_id TEXT NOT NULL, question_id TEXT NOT NULL,
       objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, attempt INTEGER DEFAULT 1,
@@ -875,6 +881,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.4-001','1.8.4','Adaptive research recursion, source health, attention budgets, and evidence gates')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.5-001','1.8.5','Research specialist reliability: robust JSON parsing, schema validation, diagnostics, and bounded evidence-gap branching')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.7-001','1.8.7','Compute budget governor with conservative neuron accounting, throttling, and fail-closed AI authority')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.8-001','1.8.8','Opportunity qualification evidence contract: fail-closed graduation gate, explicit commercial dimensions, recursive evidence-gap research, and no Founder package on weak intelligence')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -4634,6 +4641,7 @@ Treat the venture as isolated: use its own context, economics, risks and objecti
 Return ONLY JSON with keys: research_goal, questions. questions must be an array of 4-8 objects with question, source_classes, priority, why_it_matters.
 Allowed source_classes: official-statistics, procurement, municipal-procurement, trade-market, industry-market, technology-signal, regulatory, customer-demand, competitor-pricing, labour, supply-chain.
 Prioritize direct evidence capable of changing a business decision. Unfamiliar industries trigger research, not rejection.
+For opportunity-discovery missions, the program must seek evidence for these commercial dimensions before graduation: named buyer/customer, painful problem, concrete offer, demand/purchasing evidence, competitors/substitutes, pricing/unit economics, operational requirements, material risks, and learnability/advantage. Generic sector growth or market statistics are context, not an opportunity by themselves.
 `;
 
 async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) {
@@ -4880,7 +4888,8 @@ async function getMissionResearchEvidence(env,objectiveId){
   const attention=await env.DB.prepare(`SELECT * FROM research_attention_ledger WHERE objective_id=? ORDER BY created_at DESC LIMIT 1`).bind(objectiveId).first();
   const sourceHealth=(await env.DB.prepare(`SELECT * FROM research_source_health ORDER BY source_id`).all()).results||[];
   const specialistDiagnostics=(await env.DB.prepare(`SELECT id,run_id,question_id,attempt,stage,status,error,raw_preview,parsed_json,created_at FROM research_specialist_diagnostics WHERE objective_id=? ORDER BY created_at`).bind(objectiveId).all()).results||[];
-  return {ok:true,run,questions,evidence,branches,attention,sourceHealth,specialistDiagnostics};
+  const qualificationGates=(await env.DB.prepare(`SELECT id,objective_id,work_order_id,venture_id,synthesis_id,challenge_id,status,supported_dimensions,total_dimensions,critical_dimensions_supported,qualification_json,next_questions_json,created_at FROM opportunity_qualification_gates WHERE objective_id=? ORDER BY created_at`).bind(objectiveId).all()).results||[];
+  return {ok:true,run,questions,evidence,branches,attention,sourceHealth,specialistDiagnostics,qualificationGates};
 }
 
 const EVIDENCE_CURATOR_SYSTEM=`
@@ -4928,6 +4937,84 @@ async function runOperationalWorker(env, workerJobId) {
   return {resultId,recovered:false};
 }
 
+const OPPORTUNITY_QUALIFICATION_SYSTEM = `
+You are the VIS Opportunity Qualification Gate. Decide whether the supplied research and synthesis establish a concrete B2B opportunity strongly enough to create a Founder decision package.
+This is an evidence contract, not a writing-quality review. Generic sectors, trends, permits, statistics, technologies, or broad markets are NOT opportunities by themselves.
+Use ONLY the supplied evidence, research answers, synthesis, and Vector challenge. Do not fill gaps with general knowledge.
+Return ONE JSON object only with this schema:
+{
+  "opportunity_name":"specific opportunity or UNKNOWN",
+  "dimensions":{
+    "buyer":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "pain":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "offer":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "demand":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "competition":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "pricing_economics":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "operations":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "risks":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "learnability_advantage":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]},
+    "route_to_market":{"status":"supported|partial|missing","summary":"...","evidence_refs":["evidence-id"]}
+  },
+  "next_research_questions":["specific question"],
+  "overall_ready":false,
+  "reason":"..."
+}
+A dimension is supported only when supplied evidence directly supports it. Inference alone is partial at best. overall_ready may be true only for one concrete opportunity with all critical dimensions buyer, pain, offer, demand, and pricing_economics supported, at least 8 of 10 total dimensions supported, and no material unresolved contradiction.
+`;
+
+function validateOpportunityQualification(raw,allowedEvidenceIds){
+  const p=extractJSONObject(raw);
+  if(!p||typeof p!=='object'||Array.isArray(p)) throw new Error('Opportunity qualification output is not a JSON object.');
+  const names=['buyer','pain','offer','demand','competition','pricing_economics','operations','risks','learnability_advantage','route_to_market'];
+  if(!p.dimensions||typeof p.dimensions!=='object') throw new Error('Opportunity qualification dimensions missing.');
+  const allowed=new Set(allowedEvidenceIds||[]), dimensions={};
+  for(const name of names){
+    const d=p.dimensions[name];
+    if(!d||!['supported','partial','missing'].includes(String(d.status))) throw new Error(`Opportunity qualification dimension invalid: ${name}`);
+    const refs=[...new Set((Array.isArray(d.evidence_refs)?d.evidence_refs:[]).map(String).filter(x=>allowed.has(x)))].slice(0,8);
+    let status=String(d.status);
+    if(status==='supported'&&!refs.length) status='partial';
+    dimensions[name]={status,summary:cleanText(d.summary||'',1800),evidence_refs:refs};
+  }
+  const supported=names.filter(n=>dimensions[n].status==='supported').length;
+  const critical=['buyer','pain','offer','demand','pricing_economics'];
+  const criticalSupported=critical.filter(n=>dimensions[n].status==='supported').length;
+  const ready=Boolean(p.overall_ready)&&supported>=8&&criticalSupported===critical.length;
+  return {opportunity_name:cleanText(p.opportunity_name||'UNKNOWN',500),dimensions,next_research_questions:(Array.isArray(p.next_research_questions)?p.next_research_questions:[]).map(x=>cleanText(x,1200)).filter(x=>x.length>=15).slice(0,8),overall_ready:ready,reason:cleanText(p.reason||'',2500),supported_dimensions:supported,critical_dimensions_supported:criticalSupported,total_dimensions:names.length};
+}
+
+async function qualifyOperationalOpportunity(env,{objectiveId,workOrderId,ventureId,objective,researchAnswers,directResearch,departmentSynthesisId,departmentSynthesis,challenge}){
+  const allowed=(directResearch||[]).map(x=>x.id).filter(Boolean);
+  let q;
+  try{
+    const raw=await think(env,OPPORTUNITY_QUALIFICATION_SYSTEM,`OBJECTIVE: ${objective}\nVENTURE: ${ventureId}\nRESEARCH ANSWERS: ${JSON.stringify(researchAnswers)}\nDIRECT EVIDENCE: ${JSON.stringify(directResearch)}\nDISCOVERY SYNTHESIS: ${departmentSynthesis}\nVECTOR CHALLENGE: ${challenge?.review||''}\nVECTOR DECISION: ${challenge?.decision||'UNKNOWN'}`,1800,.1);
+    q=validateOpportunityQualification(raw,allowed);
+  }catch(error){
+    q={opportunity_name:'UNKNOWN',dimensions:Object.fromEntries(['buyer','pain','offer','demand','competition','pricing_economics','operations','risks','learnability_advantage','route_to_market'].map(n=>[n,{status:'missing',summary:'Qualification could not be validated.',evidence_refs:[]}])) ,next_research_questions:['What primary-source evidence identifies a specific buyer, painful problem, concrete offer, demonstrated demand, and viable pricing/economics for one opportunity?'],overall_ready:false,reason:`Fail-closed qualification: ${cleanText(error?.message||String(error),1200)}`,supported_dimensions:0,critical_dimensions_supported:0,total_dimensions:10};
+  }
+  if(challenge?.decision==='REJECT') { q.overall_ready=false; q.reason=cleanText(`${q.reason} Vector rejected the synthesis; graduation is blocked.`,2500); }
+  const status=q.overall_ready?'qualified':'research_required';
+  const id=`OQG-${crypto.randomUUID()}`;
+  await env.DB.prepare(`INSERT INTO opportunity_qualification_gates (id,objective_id,work_order_id,venture_id,synthesis_id,challenge_id,status,supported_dimensions,total_dimensions,critical_dimensions_supported,qualification_json,next_questions_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id,objectiveId,workOrderId,ventureId,departmentSynthesisId,challenge?.id||null,status,q.supported_dimensions,q.total_dimensions,q.critical_dimensions_supported,JSON.stringify(q),JSON.stringify(q.next_research_questions)).run();
+  return {id,status,...q};
+}
+
+async function enqueueQualificationResearchGaps(env,{planId,objectiveId,ventureId,questions}){
+  let created=0;
+  for(const question0 of (questions||[]).slice(0,8)){
+    const question=cleanText(question0,1200); if(question.length<15) continue;
+    const fp=await branchFingerprint(question);
+    const existing=await env.DB.prepare(`SELECT id FROM mission_research_branches WHERE objective_id=? AND fingerprint=? LIMIT 1`).bind(objectiveId,fp).first();
+    if(existing) continue;
+    const bid=`MRB-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO mission_research_branches (id,run_id,parent_question_id,objective_id,venture_id,question,rationale,priority,status,depth,fingerprint) VALUES (?,NULL,NULL,?,?,?,?,?,'queued',1,?)`).bind(bid,objectiveId,ventureId,question,'Opportunity qualification evidence gap',5,fp).run();
+    await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,? ,5,'open',?)`).bind(`MRQ-${crypto.randomUUID()}`,planId,objectiveId,ventureId,question,JSON.stringify(['customer-demand','competitor-pricing','industry-market','procurement']),nowISO()).run();
+    created++;
+  }
+  return created;
+}
+
 async function createFounderDecisionPackage(env, record) {
   assertInternalAuthority(record.authorityScope||'internal-zero-dollar');
   const id=`FDP-${crypto.randomUUID()}`;
@@ -4970,7 +5057,7 @@ async function processOperationalObjective(env, objectiveId) {
       await audit(env,'ADAPTIVE_RESEARCH','EVIDENCE_GATE_HELD',wo,JSON.stringify({objectiveId:row.id,researchRun,externalSpendUSD:0}));
       return {ok:true,objectiveId:row.id,workOrderId:wo,status:'research_required',researchRun,founderActionRequired:false,externalSpendUSD:0};
     }
-    const directResearch=(await env.DB.prepare(`SELECT question_id,source_name,source_url,title,evidence_text,relevance,source_quality,verification_status,retrieved_at FROM mission_research_evidence WHERE objective_id=? ORDER BY created_at LIMIT 30`).bind(row.id).all()).results||[];
+    const directResearch=(await env.DB.prepare(`SELECT id,question_id,source_name,source_url,title,evidence_text,relevance,source_quality,verification_status,retrieved_at FROM mission_research_evidence WHERE objective_id=? ORDER BY created_at LIMIT 30`).bind(row.id).all()).results||[];
     const recentEvidence=await env.DB.prepare(`SELECT source_name,item_url,title,evidence_text,verification_status,retrieved_at FROM evidence ORDER BY id DESC LIMIT 40`).all();
     const curatedEvidence=await curateMissionEvidence(env,{objective:row.objective,ventureId,researchPlan:researchPlan.plan,candidates:recentEvidence.results||[]});
     const researchAnswers=(await env.DB.prepare(`SELECT id,question,priority,status,answer_summary,evidence_refs FROM mission_research_questions WHERE plan_id=? ORDER BY COALESCE(priority,3) DESC,created_at`).bind(researchPlan.id).all()).results||[];
@@ -4998,12 +5085,26 @@ async function processOperationalObjective(env, objectiveId) {
     const dsId=`DS-${crypto.randomUUID()}`;
     await env.DB.prepare(`INSERT INTO department_syntheses (id,work_order_id,department_id,head_agent,synthesis,evidence_refs,worker_result_refs,status) VALUES (?,?,?,?,?,?,?,'submitted')`).bind(dsId,wo,'DISCOVERY',head?.agent_id||'ATLAS',cleanText(departmentText,12000),JSON.stringify(seeds),JSON.stringify(managerSyntheses.flatMap(x=>x.workerRefs))).run();
     const challenge=await createCrossDepartmentReview(env,{workOrderId:wo,reviewerDepartmentId:'DILIGENCE',subjectSynthesisId:dsId,objective:row.objective});
-    const knowledgeId=await reintegrateHiveKnowledge(env,{workOrderId:wo,synthesisId:dsId,reviewRefs:[challenge.id],knowledgeType:'operational-learning',subject:`Operational learning ${row.id}`,content:`DISCOVERY synthesis: ${departmentText}\nIndependent DILIGENCE review: ${challenge.review}`,confidence:.75,verificationStatus:'vector-reviewed',disposition:challenge.decision==='REJECT'?'held':'accepted',rationale:'Real operational work completed under internal-zero-dollar authority with independent challenge.'});
+    const qualification=await qualifyOperationalOpportunity(env,{objectiveId:row.id,workOrderId:wo,ventureId,objective:row.objective,researchAnswers,directResearch,departmentSynthesisId:dsId,departmentSynthesis:departmentText,challenge});
+    const disposition=qualification.status==='qualified'&&challenge.decision!=='REJECT'?'accepted':'held';
+    const knowledgeId=await reintegrateHiveKnowledge(env,{workOrderId:wo,synthesisId:dsId,reviewRefs:[challenge.id],knowledgeType:'operational-learning',subject:`Operational learning ${row.id}`,content:`DISCOVERY synthesis: ${departmentText}\nIndependent DILIGENCE review: ${challenge.review}\nOpportunity qualification: ${JSON.stringify(qualification)}`,confidence:qualification.status==='qualified'?.8:.55,verificationStatus:'vector-and-qualification-reviewed',disposition,rationale:qualification.status==='qualified'?'Commercial evidence contract passed after independent challenge.':'Commercial evidence contract held; additional mission-directed research required.'});
+    if(qualification.status!=='qualified'){
+      const gapQuestions=qualification.next_research_questions.length?qualification.next_research_questions:[
+        `Which specific buyer currently purchases or budgets for the proposed offer in ${ventureId}?`,
+        `What primary evidence demonstrates a costly or urgent buyer problem for the proposed offer?`,
+        `What current pricing, contract value, gross-margin inputs, or comparable economics support commercial viability?`
+      ];
+      const queuedResearchQuestions=await enqueueQualificationResearchGaps(env,{planId:researchPlan.id,objectiveId:row.id,ventureId,questions:gapQuestions});
+      await env.DB.prepare(`UPDATE work_orders SET status='research_required',last_updated=? WHERE id=?`).bind(nowISO(),wo).run();
+      await env.DB.prepare(`UPDATE operational_objectives SET status='research_required',decision_package_id=NULL,last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
+      await audit(env,'OPPORTUNITY_QUALIFICATION','QUALIFICATION_GATE_HELD',wo,JSON.stringify({objectiveId:row.id,qualificationId:qualification.id,supportedDimensions:qualification.supported_dimensions,criticalDimensionsSupported:qualification.critical_dimensions_supported,challengeDecision:challenge.decision,queuedResearchQuestions,externalSpendUSD:0}));
+      return {ok:true,objectiveId:row.id,workOrderId:wo,status:'research_required',planningMode:planning.planningMode,departmentSynthesisMode:departmentMode,managerCount:assignments.length,workerCount:workers.length,challengeDecision:challenge.decision,qualificationGateId:qualification.id,qualificationStatus:qualification.status,supportedDimensions:qualification.supported_dimensions,criticalDimensionsSupported:qualification.critical_dimensions_supported,queuedResearchQuestions,reintegratedKnowledgeId:knowledgeId,founderActionRequired:false,externalSpendUSD:0};
+    }
     const pkg=await createFounderDecisionPackage(env,{objectiveId:row.id,workOrderId:wo,objective:row.objective,departmentSynthesisId:dsId,departmentSynthesis:departmentText,challengeId:challenge.id,challengeReview:challenge.review,challengeDecision:challenge.decision,knowledgeId,authorityScope:row.authority_scope,ventureId});
     await env.DB.prepare(`UPDATE work_orders SET status='completed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),wo).run();
     await env.DB.prepare(`UPDATE operational_objectives SET status='completed',decision_package_id=?,completed_at=?,last_updated=? WHERE id=?`).bind(pkg.id,nowISO(),nowISO(),row.id).run();
-    await audit(env,'HIVE_OPERATIONAL_INTAKE','OBJECTIVE_COMPLETED',wo,JSON.stringify({objectiveId:row.id,planningMode:planning.planningMode,departmentMode,managerCount:assignments.length,workerCount:workers.length,challengeDecision:challenge.decision,decisionPackageId:pkg.id,externalSpendUSD:0}));
-    return {ok:true,objectiveId:row.id,workOrderId:wo,status:'completed',planningMode:planning.planningMode,departmentSynthesisMode:departmentMode,managerCount:assignments.length,workerCount:workers.length,challengeDecision:challenge.decision,decisionPackageId:pkg.id,reintegratedKnowledgeId:knowledgeId,externalSpendUSD:0};
+    await audit(env,'HIVE_OPERATIONAL_INTAKE','OBJECTIVE_COMPLETED',wo,JSON.stringify({objectiveId:row.id,planningMode:planning.planningMode,departmentMode,managerCount:assignments.length,workerCount:workers.length,challengeDecision:challenge.decision,qualificationGateId:qualification.id,decisionPackageId:pkg.id,externalSpendUSD:0}));
+    return {ok:true,objectiveId:row.id,workOrderId:wo,status:'completed',planningMode:planning.planningMode,departmentSynthesisMode:departmentMode,managerCount:assignments.length,workerCount:workers.length,challengeDecision:challenge.decision,qualificationGateId:qualification.id,decisionPackageId:pkg.id,reintegratedKnowledgeId:knowledgeId,externalSpendUSD:0};
   } catch(error) {
     await env.DB.prepare(`UPDATE operational_objectives SET status='failed',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
     await env.DB.prepare(`UPDATE work_orders SET status='failed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),wo).run().catch(()=>{});
