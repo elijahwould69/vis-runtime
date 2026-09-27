@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.21-transaction-identity-lock",
+  version: "1.8.22-procurement-detail-discovery",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -900,6 +900,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.8-001','1.8.8','Opportunity qualification evidence contract: fail-closed graduation gate, explicit commercial dimensions, recursive evidence-gap research, and no Founder package on weak intelligence')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.20-001','1.8.20','Transaction evidence extraction: field-level provenance, fail-closed transaction qualification, and gap-directed follow-up research')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.21-001','1.8.21','Transaction identity lock: candidate discovery is separated from transaction evidence; critical fields must converge on one canonical procurement record before qualification')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.22-001','1.8.22','Procurement detail-page discovery: search pages discover candidates; bounded source adapters resolve and fetch individual procurement records before identity qualification; acceptance missions quarantined from cron continuation')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -4963,11 +4964,70 @@ async function fetchResearchDocument(env,sourceId,url){
       const text=ct.includes('html')?stripHTMLResearch(body):cleanText(body,12000);
       if(!text||text.length<120){ last='empty-or-thin-document'; continue; }
       await recordSourceHealth(env,sourceId,true);
-      return {url,title:url,text};
+      return {url,title:url,text,rawHTML:ct.includes('html')?body:''};
     }catch(e){ clearTimeout(timer); last=cleanText(e?.message||String(e),500); }
   }
   await recordSourceHealth(env,sourceId,false,last||'fetch-failed');
   return null;
+}
+
+function absoluteResearchURL(base,href){
+  try{
+    const raw=String(href||'').trim();
+    if(!raw||raw.startsWith('#')||raw.startsWith('javascript:')||raw.startsWith('mailto:')) return null;
+    const u=new URL(raw,base);
+    if(!/^https?:$/.test(u.protocol)) return null;
+    u.hash='';
+    return u.toString();
+  }catch(_){ return null; }
+}
+
+function extractResearchLinks(doc){
+  const html=String(doc?.rawHTML||'');
+  if(!html) return [];
+  const out=[], seen=new Set();
+  const re=/<a\b[^>]*\bhref\s*=\s*["']([^"'<>]+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  let m;
+  while((m=re.exec(html))&&out.length<120){
+    const url=absoluteResearchURL(doc.url,m[1]);
+    if(!url||seen.has(url)) continue;
+    seen.add(url);
+    out.push({url,text:stripHTMLResearch(m[2]).slice(0,300)});
+  }
+  return out;
+}
+
+function procurementDetailCandidate(sourceId,url,anchor=''){
+  let u; try{u=new URL(url);}catch(_){return false;}
+  const path=u.pathname.replace(/\/+$/,'');
+  const text=`${path} ${anchor}`.toLowerCase();
+  if(sourceId.startsWith('SRC-CANADABUYS')){
+    if(!/canadabuys\.canada\.ca$/i.test(u.hostname)) return false;
+    if(u.searchParams.has('words')||u.searchParams.has('current_tab')||u.searchParams.has('items_per_page')) return false;
+    return /tender-opportunit.*\/(tender-notice|award-notice|notice|[a-z0-9-]{8,})/i.test(path)
+      || /solicitation|tender notice|award notice|contract history/i.test(text);
+  }
+  if(sourceId==='SRC-BC-DIGITAL-MARKETPLACE-TXN'){
+    if(!/marketplace\.digital\.gov\.bc\.ca$/i.test(u.hostname)) return false;
+    return /opportunit|procurement|contract|award|product|service/i.test(text) && path.split('/').filter(Boolean).length>=2;
+  }
+  return false;
+}
+
+async function discoverProcurementDetailDocuments(env,searchDoc,budget,maxDetails=3){
+  const links=extractResearchLinks(searchDoc)
+    .filter(x=>procurementDetailCandidate(searchDoc.sourceId,x.url,x.text))
+    .slice(0,12);
+  const docs=[];
+  for(const link of links){
+    if(docs.length>=maxDetails||budget.fetches>=budget.maxFetches) break;
+    budget.fetches++;
+    const sourceId=`${searchDoc.sourceId}-DETAIL-${(await researchFingerprint(link.url)).slice(0,10)}`;
+    const d=await fetchResearchDocument(env,sourceId,link.url);
+    if(!d?.text) continue;
+    docs.push({...d,sourceId,sourceClass:'procurement',name:`${searchDoc.name} — individual procurement record`,quality:1.0,discoveredFrom:searchDoc.url});
+  }
+  return docs;
 }
 
 function keywordsForResearch(q){
@@ -4996,9 +5056,17 @@ async function collectQuestionSources(env,qrow,budget){
   // hypotheses from real purchasing signals. This is deliberately broad but
   // bounded: five lanes maximum and the normal 20-fetch ceiling still applies.
   if(isTransactionFirstBuyerQuestion(qrow)){
-    // BC-specific observable purchasing source. The public Digital Marketplace
-    // exposes named provincial opportunities/awards and transaction values.
-    await add('SRC-BC-DIGITAL-MARKETPLACE-TXN','procurement','B.C. Digital Marketplace — transaction scan','https://marketplace.digital.gov.bc.ca/',1.0);
+    // V1.8.22: portal/search pages are candidate discovery only. Preserve their
+    // HTML long enough to resolve individual procurement-record links, then
+    // spend the remaining bounded source budget on those canonical records.
+    const searchDocs=[];
+    const addSearch=async(sourceId,name,url)=>{
+      if(budget.fetches>=budget.maxFetches) return;
+      budget.fetches++;
+      const d=await fetchResearchDocument(env,sourceId,url);
+      if(d?.text) searchDocs.push({...d,sourceId,sourceClass:'procurement',name,quality:1.0});
+    };
+    await addSearch('SRC-BC-DIGITAL-MARKETPLACE-TXN','B.C. Digital Marketplace — transaction scan','https://marketplace.digital.gov.bc.ca/');
     const lanes=[
       ['maintenance repair services','MAINTENANCE'],
       ['inspection testing services','INSPECTION'],
@@ -5008,10 +5076,17 @@ async function collectQuestionSources(env,qrow,budget){
     ];
     for(const [phrase,id] of lanes){
       if(budget.fetches>=budget.maxFetches) break;
-      const term=encodeURIComponent(phrase);
-      await add(`SRC-CANADABUYS-TXN-${id}`,'procurement','CanadaBuys — transaction scan',`https://canadabuys.canada.ca/en/tender-opportunities?current_tab=c&items_per_page=50&words=${term}`,1.0);
+      await addSearch(`SRC-CANADABUYS-TXN-${id}`,'CanadaBuys — transaction scan',`https://canadabuys.canada.ca/en/tender-opportunities?current_tab=c&items_per_page=50&words=${encodeURIComponent(phrase)}`);
     }
-    return docs.slice(0,6);
+    const details=[];
+    for(const searchDoc of searchDocs){
+      if(budget.fetches>=budget.maxFetches||details.length>=8) break;
+      const found=await discoverProcurementDetailDocuments(env,searchDoc,budget,2);
+      details.push(...found);
+    }
+    // Detail records come first so specialists and the identity extractor prefer
+    // one observable transaction. Search pages remain available only as discovery context.
+    return [...details,...searchDocs].slice(0,10);
   }
 
   if(classes.some(x=>['procurement','municipal-procurement','customer-demand','competitor-pricing','industry-market'].includes(x))){
@@ -5238,7 +5313,9 @@ function transactionSourceIsCanonical(url=''){
     if(!/^https?:$/.test(u.protocol)) return false;
     if(q.has('words')||q.has('current_tab')||q.has('items_per_page')||q.has('search')||q.has('query')||q.has('keywords')) return false;
     if(/\/tender-opportunities$/i.test(path)||/\/opportunities$/i.test(path)||/\/search$/i.test(path)) return false;
-    return path.split('/').filter(Boolean).length>=2;
+    if(/canadabuys\.canada\.ca$/i.test(u.hostname)) return /tender-opportunit.*\/(tender-notice|award-notice|notice|[a-z0-9-]{8,})/i.test(path);
+    if(/marketplace\.digital\.gov\.bc\.ca$/i.test(u.hostname)) return /opportunit|procurement|contract|award/i.test(path) && path.split('/').filter(Boolean).length>=2;
+    return path.split('/').filter(Boolean).length>=3;
   }catch(_){ return false; }
 }
 
@@ -5335,7 +5412,7 @@ async function ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,v
     const question=`Which current British Columbia public-sector purchasing transaction provides direct evidence of a named buyer organization, a concrete purchased scope, and an observable procurement mechanism? Search actual tenders, awards, purchase opportunities, or public contract records across multiple service and supply categories. Do not search for ${objectiveId} as a product, category, code, or budget item.`;
     await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,5,'open',?)`).bind(id,planId,objectiveId,ventureId,question,JSON.stringify(['procurement','municipal-procurement','customer-demand']),nowISO()).run();
     row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(id).first();
-    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.21',legacyQueueBypassed:true,externalSpendUSD:0}));
+    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.22',legacyQueueBypassed:true,externalSpendUSD:0}));
     return {buyerReady:false,question:row,created:true};
   }
   if(row.status==='answered'&&row.evidence_refs&&row.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(row.answer_summary||''))){
@@ -5755,6 +5832,7 @@ async function continueOperationalQueue(env) {
     SELECT id,status,continuation_count,continuation_limit
     FROM operational_objectives
     WHERE COALESCE(lifecycle_state,'active')='active'
+      AND COALESCE(requested_by,'') NOT IN ('HIVE-ACCEPTANCE','HIVE-ACCEPTANCE-HARNESS')
       AND COALESCE(continuation_count,0) < COALESCE(continuation_limit,8)
       AND (
         status='queued'
