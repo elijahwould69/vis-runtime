@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.15-evidence-dependency-graph",
+  version: "1.8.16-transaction-first-discovery",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -4811,6 +4811,8 @@ Required schema:
   "follow_up_questions": ["narrow question that could resolve a gap"]
 }
 Rules:
+- For a buyer/procurement question, prefer an observable current transaction: name the purchasing organization or narrowly defined buyer, the purchased scope/category, and the purchasing mechanism only when directly supported by supplied source material. Do not infer a buyer from sector statistics.
+- When multiple transaction records are present, select a concrete candidate with the strongest direct evidence; do not rank candidates by subjective attractiveness.
 - confidence must be between 0 and 1.
 - evidence_indexes must contain only zero-based indexes explicitly listed in AVAILABLE_EVIDENCE_INDEXES. Never invent an index.
 - gaps must be an array of concise strings.
@@ -4959,6 +4961,11 @@ function keywordsForResearch(q){
   return String(q||'').toLowerCase().replace(/[^a-z0-9\s-]/g,' ').split(/\s+/).filter(x=>x.length>3&&!stop.has(x)).slice(0,9);
 }
 
+function isTransactionFirstBuyerQuestion(qrow){
+  const dim=canonicalDependencyDimension(qrow?.question||'')||classifyCommercialDimension(qrow?.question||'');
+  return dim==='buyer' && /buyer|procurement|purchas|budget|contract|tender|award/i.test(String(qrow?.question||''));
+}
+
 async function collectQuestionSources(env,qrow,budget){
   let classes=[]; try{ classes=JSON.parse(qrow.source_classes||'[]'); }catch(_){}
   const words=keywordsForResearch(qrow.question), docs=[];
@@ -4968,6 +4975,28 @@ async function collectQuestionSources(env,qrow,budget){
     const d=await fetchResearchDocument(env,sourceId,url);
     if(d&&d.text) docs.push({...d,sourceId,sourceClass,name,quality});
   };
+
+  // V1.8.16: when the mission has not yet established a buyer, do not search
+  // procurement systems for the abstract objective name. Scan observable
+  // transactions first, then let the specialist infer candidate buyer/scope
+  // hypotheses from real purchasing signals. This is deliberately broad but
+  // bounded: five lanes maximum and the normal 20-fetch ceiling still applies.
+  if(isTransactionFirstBuyerQuestion(qrow)){
+    const lanes=[
+      ['maintenance repair services','MAINTENANCE'],
+      ['inspection testing services','INSPECTION'],
+      ['equipment supply installation','EQUIPMENT'],
+      ['construction services','CONSTRUCTION'],
+      ['professional services','PROFESSIONAL']
+    ];
+    for(const [phrase,id] of lanes){
+      if(budget.fetches>=budget.maxFetches) break;
+      const term=encodeURIComponent(phrase);
+      await add(`SRC-CANADABUYS-TXN-${id}`,'procurement','CanadaBuys — transaction scan',`https://canadabuys.canada.ca/en/tender-opportunities?current_tab=c&items_per_page=50&words=${term}`,1.0);
+    }
+    return docs.slice(0,6);
+  }
+
   if(classes.some(x=>['procurement','municipal-procurement','customer-demand','competitor-pricing','industry-market'].includes(x))){
     const term=encodeURIComponent(words.join(' ')||'construction maintenance');
     await add('SRC-CANADABUYS','procurement','CanadaBuys',`https://canadabuys.canada.ca/en/tender-opportunities?current_tab=c&items_per_page=50&words=${term}`,1.0);
