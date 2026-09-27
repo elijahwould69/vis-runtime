@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.4-adaptive-research-engine",
+  version: "1.8.5-research-reliability",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -815,6 +815,12 @@ async function ensureSchema(env) {
     )`,
     `CREATE TABLE IF NOT EXISTS schema_migrations (
       id TEXT PRIMARY KEY, version TEXT NOT NULL, description TEXT NOT NULL, applied_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS research_specialist_diagnostics (
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, plan_id TEXT NOT NULL, question_id TEXT NOT NULL,
+      objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, attempt INTEGER DEFAULT 1,
+      stage TEXT NOT NULL, status TEXT NOT NULL, error TEXT, raw_preview TEXT,
+      parsed_json TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`
   ];
 
@@ -829,6 +835,7 @@ async function ensureSchema(env) {
     `ALTER TABLE mission_research_branches ADD COLUMN completed_at TEXT`
   ]) { try { await env.DB.prepare(sql).run(); } catch (_) {} }
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.4-001','1.8.4','Adaptive research recursion, source health, attention budgets, and evidence gates')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.5-001','1.8.5','Research specialist reliability: robust JSON parsing, schema validation, diagnostics, and bounded evidence-gap branching')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -4550,10 +4557,70 @@ async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) 
 
 const RESEARCH_SPECIALIST_SYSTEM=`
 You are a VIS Research Source Specialist. Answer one mission research question using ONLY the supplied retrieved public-source material.
-Separate verified observations from inference. Do not invent facts. If the material does not answer the question, say INSUFFICIENT.
-Return ONLY JSON with keys: answer, confidence, evidence_indexes, gaps, follow_up_questions.
-confidence is 0-1. evidence_indexes is an array of zero-based indexes into SOURCE MATERIAL. follow_up_questions is 0-2 narrowly targeted questions justified by the evidence gap.
+Separate verified observations from inference. Do not invent facts. If the supplied material cannot support an answer, begin answer with INSUFFICIENT: and explain the exact missing evidence.
+Return ONE JSON object only. No markdown fences and no prose outside JSON.
+Required schema:
+{
+  "answer": "string",
+  "confidence": 0.0,
+  "evidence_indexes": [0],
+  "gaps": ["specific unresolved evidence gap"],
+  "follow_up_questions": ["narrow question that could resolve a gap"]
+}
+Rules:
+- confidence must be between 0 and 1.
+- evidence_indexes must contain only zero-based indexes that actually support the answer.
+- gaps must be an array of concise strings.
+- follow_up_questions must contain 0-2 narrow, researchable questions and must not merely restate the parent question.
+- If evidence is insufficient, use confidence below 0.55 and still identify specific gaps and useful follow-up questions when possible.
 `;
+
+function validateResearchSpecialistOutput(raw,docCount){
+  const parsed=extractJSONObject(raw);
+  if(!parsed||typeof parsed!=='object'||Array.isArray(parsed)) throw new Error('Research specialist output is not a JSON object.');
+  if(typeof parsed.answer!=='string'||!parsed.answer.trim()) throw new Error('Research specialist answer missing.');
+  const confidence=Number(parsed.confidence);
+  if(!Number.isFinite(confidence)||confidence<0||confidence>1) throw new Error('Research specialist confidence must be 0-1.');
+  if(!Array.isArray(parsed.evidence_indexes)) throw new Error('Research specialist evidence_indexes must be an array.');
+  const evidenceIndexes=[...new Set(parsed.evidence_indexes.map(Number))];
+  if(evidenceIndexes.some(i=>!Number.isInteger(i)||i<0||i>=docCount)) throw new Error('Research specialist referenced an invalid evidence index.');
+  if(!Array.isArray(parsed.gaps)) throw new Error('Research specialist gaps must be an array.');
+  if(!Array.isArray(parsed.follow_up_questions)) throw new Error('Research specialist follow_up_questions must be an array.');
+  return {
+    answer: cleanText(parsed.answer,5000),
+    confidence,
+    evidence_indexes:evidenceIndexes.slice(0,4),
+    gaps:parsed.gaps.map(x=>cleanText(x,800)).filter(Boolean).slice(0,6),
+    follow_up_questions:parsed.follow_up_questions.map(x=>cleanText(x,1200)).filter(Boolean).slice(0,2)
+  };
+}
+
+async function recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt,stage,status,error='',raw='',parsed=null}){
+  const id=`RSD-${crypto.randomUUID()}`;
+  await env.DB.prepare(`INSERT INTO research_specialist_diagnostics
+    (id,run_id,plan_id,question_id,objective_id,venture_id,attempt,stage,status,error,raw_preview,parsed_json)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`).bind(
+      id,runId,planId,qrow.id,qrow.objective_id,qrow.venture_id,Number(attempt||1),
+      cleanText(stage,120),cleanText(status,120),cleanText(error,3000),
+      cleanText(raw,3000),parsed?JSON.stringify(parsed):null
+    ).run();
+  return id;
+}
+
+function deterministicEvidenceGapQuestions(qrow,docs,error=''){
+  const classes=(()=>{try{return JSON.parse(qrow.source_classes||'[]')}catch{return []}})();
+  const sourceNames=[...new Set((docs||[]).map(d=>d.name).filter(Boolean))].slice(0,3);
+  const context=sourceNames.length?` Sources retrieved: ${sourceNames.join(', ')}.`:'';
+  const gap=cleanText(error||'Retrieved material did not yield a validated answer.',500);
+  const qs=[
+    `What specific official or primary-source evidence directly answers: ${cleanText(qrow.question,700)}?`,
+    `Which current dataset, procurement record, buyer document, or regulator source can resolve the missing evidence for: ${cleanText(qrow.question,650)}?`
+  ];
+  if(classes.includes('procurement')||classes.includes('municipal-procurement')) qs[1]=`Which current official procurement notices or awarded-contract records directly address: ${cleanText(qrow.question,650)}?`;
+  else if(classes.includes('labour')) qs[1]=`Which current Statistics Canada or British Columbia labour dataset directly measures the workforce issue in: ${cleanText(qrow.question,650)}?`;
+  else if(classes.includes('official-statistics')) qs[1]=`Which current Statistics Canada or BC Stats table directly measures the market condition in: ${cleanText(qrow.question,650)}?`;
+  return {gap:`specialist-output-failure: ${gap}.${context}`,questions:qs};
+}
 
 async function researchFingerprint(value){
   const bytes=new TextEncoder().encode(String(value||''));
@@ -4582,7 +4649,7 @@ async function fetchResearchDocument(env,sourceId,url){
   for(let attempt=1;attempt<=2;attempt++){
     const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),7000);
     try{
-      const r=await fetch(url,{headers:{'User-Agent':'VIS-Research/1.8.4 (+internal business research; zero-dollar)','Accept':'text/html,application/atom+xml,application/xml,text/plain;q=0.9,*/*;q=0.5'},signal:controller.signal});
+      const r=await fetch(url,{headers:{'User-Agent':'VIS-Research/1.8.5 (+internal business research; zero-dollar)','Accept':'text/html,application/atom+xml,application/xml,text/plain;q=0.9,*/*;q=0.5'},signal:controller.signal});
       clearTimeout(timer);
       if(!r.ok){ last=`HTTP ${r.status}`; continue; }
       const ct=r.headers.get('content-type')||''; const body=await r.text();
@@ -4642,9 +4709,20 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
     attempted++;
     const docs=await collectQuestionSources(env,qrow,budget);
     if(!docs.length){ await env.DB.prepare(`UPDATE mission_research_questions SET status='research_required',answer_summary=?,last_updated=? WHERE id=?`).bind('No configured public source returned usable material.',nowISO(),qrow.id).run(); return; }
-    let parsed=null;
-    try{ const material=docs.map((d,i)=>`[${i}] ${d.name} | ${d.url}\n${d.text.slice(0,5000)}`).join('\n\n'); const raw=await think(env,RESEARCH_SPECIALIST_SYSTEM,`QUESTION: ${qrow.question}\nSOURCE MATERIAL:\n${material}`,1400,.15); const m=String(raw||'').match(/\{[\s\S]*\}/); if(m) parsed=JSON.parse(m[0]); }catch(_){}
-    if(!parsed) parsed={answer:'INSUFFICIENT: source specialist could not produce a validated answer.',confidence:0,evidence_indexes:[],gaps:['specialist-output-failure'],follow_up_questions:[]};
+    let parsed=null, specialistError='', specialistRaw='';
+    try{
+      const material=docs.map((d,i)=>`[${i}] ${d.name} | ${d.url}\n${d.text.slice(0,5000)}`).join('\n\n');
+      specialistRaw=await think(env,RESEARCH_SPECIALIST_SYSTEM,`QUESTION: ${qrow.question}\nSOURCE MATERIAL:\n${material}\nReturn one JSON object only.`,1600,.1);
+      parsed=validateResearchSpecialistOutput(specialistRaw,docs.length);
+      await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'parse-and-validate',status:'validated',raw:specialistRaw,parsed});
+    }catch(error){
+      specialistError=cleanText(error?.stack||error?.message||String(error),3000);
+      try{ await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'parse-and-validate',status:'failed',error:specialistError,raw:specialistRaw}); }catch(_){}
+      try{ await recordFailure(env,runId,`research-specialist:${qrow.id}`,error); }catch(_){}
+      try{ await audit(env,'JANITOR','RESEARCH_SPECIALIST_DIAGNOSIS',qrow.id,JSON.stringify({objectiveId,qrow:qrow.id,error:specialistError})); }catch(_){}
+      const fallback=deterministicEvidenceGapQuestions(qrow,docs,specialistError);
+      parsed={answer:`INSUFFICIENT: research specialist output failed validation. ${cleanText(specialistError,1200)}`,confidence:0,evidence_indexes:[],gaps:[fallback.gap],follow_up_questions:fallback.questions};
+    }
     const refs=[];
     for(const idx of (Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[]).slice(0,4)){ const doc=docs[Number(idx)]; if(!doc) continue; const eid=await persistResearchEvidence(env,{runId,planId,qrow,doc,text:doc.text,relevance:Number(parsed.confidence||.5)}); if(!refs.includes(eid)) refs.push(eid); }
     evidenceCount+=(new Set(refs)).size;
@@ -4682,7 +4760,8 @@ async function getMissionResearchEvidence(env,objectiveId){
   const branches=(await env.DB.prepare(`SELECT * FROM mission_research_branches WHERE objective_id=? ORDER BY priority DESC,created_at`).bind(objectiveId).all()).results||[];
   const attention=await env.DB.prepare(`SELECT * FROM research_attention_ledger WHERE objective_id=? ORDER BY created_at DESC LIMIT 1`).bind(objectiveId).first();
   const sourceHealth=(await env.DB.prepare(`SELECT * FROM research_source_health ORDER BY source_id`).all()).results||[];
-  return {ok:true,run,questions,evidence,branches,attention,sourceHealth};
+  const specialistDiagnostics=(await env.DB.prepare(`SELECT id,run_id,question_id,attempt,stage,status,error,raw_preview,parsed_json,created_at FROM research_specialist_diagnostics WHERE objective_id=? ORDER BY created_at`).bind(objectiveId).all()).results||[];
+  return {ok:true,run,questions,evidence,branches,attention,sourceHealth,specialistDiagnostics};
 }
 
 const EVIDENCE_CURATOR_SYSTEM=`
