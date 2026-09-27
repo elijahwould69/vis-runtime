@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.30-memory-quality-consolidation",
+  version: "1.8.31-memory-score-normalization",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -912,6 +912,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.28-001','1.8.28','Objective Lifecycle and Learning Closure: terminal objectives transition to completed lifecycle state; residual learning is detached into Hive knowledge; completed objectives are permanently excluded from continuation')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.29-001','1.8.29','Institutional Learning Retrieval and Reuse: new missions retrieve relevant active Hive knowledge with provenance, venture-boundary classification, and bounded reuse packets before research planning')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.30-001','1.8.30','Memory Quality and Consolidation: exclude self-memory, rank by evidence value and recency, penalize redundant objective echoes, diversify memory packets, and preserve provenance and venture boundaries')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.31-001','1.8.31','Memory Score Normalization: normalize lexical overlap to a true zero-to-one range and cap founder-objective echoes so validated Hive knowledge cannot be crowded out by repetitive objective text')`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mission_knowledge_retrievals (
     id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, knowledge_id TEXT NOT NULL,
     relevance REAL DEFAULT 0, boundary_class TEXT NOT NULL, reuse_disposition TEXT NOT NULL,
@@ -4875,7 +4876,7 @@ async function retrieveInstitutionalLearning(env,{objectiveId,ventureId,objectiv
     const hay=learningTokens(`${row.subject||''} ${row.content||''}`);
     const hs=new Set(hay);
     const overlap=missionTokens.filter(t=>hs.has(t));
-    const lexical=missionTokens.length?overlap.length/Math.min(missionTokens.length,24):0;
+    const lexical=missionTokens.length?Math.min(1,overlap.length/missionTokens.length):0;
     const evidenceValue=memoryTypeWeight(row);
     const recency=memoryRecencyWeight(row.created_at);
     const confidence=Math.max(0,Math.min(1,Number(row.confidence||0)))*0.08;
@@ -4892,14 +4893,18 @@ async function retrieveInstitutionalLearning(env,{objectiveId,ventureId,objectiv
 
   const selected=[];
   const signatureCounts=new Map();
+  let founderObjectiveCount=0;
   for(const candidate of scored){
     if(selected.length>=12) break;
+    const knowledgeType=String(candidate.row.knowledge_type||'');
+    if(knowledgeType==='founder-objective' && founderObjectiveCount>=2) continue;
     const sigCount=signatureCounts.get(candidate.signature)||0;
-    if(sigCount>=1 && String(candidate.row.knowledge_type||'')==='founder-objective') continue;
+    if(sigCount>=1 && knowledgeType==='founder-objective') continue;
     const nearDuplicate=selected.some(x=>tokenSimilarity(x.tokens,candidate.tokens)>=0.86 &&
-      String(x.row.knowledge_type||'')===String(candidate.row.knowledge_type||''));
+      String(x.row.knowledge_type||'')===knowledgeType);
     if(nearDuplicate) continue;
     selected.push(candidate);
+    if(knowledgeType==='founder-objective') founderObjectiveCount++;
     signatureCounts.set(candidate.signature,sigCount+1);
   }
 
@@ -4915,7 +4920,7 @@ async function retrieveInstitutionalLearning(env,{objectiveId,ventureId,objectiv
     selected:selected.length,knowledgeIds:selected.map(x=>x.row.id),
     knowledgeTypes:selected.map(x=>x.row.knowledge_type),
     boundaryClasses:selected.map(x=>x.boundary),
-    selfMemoryExcluded:true,redundancySuppression:true,externalSpendUSD:0
+    selfMemoryExcluded:true,redundancySuppression:true,founderObjectiveCap:2,lexicalNormalization:true,externalSpendUSD:0
   }));
   return selected;
 }
@@ -4942,7 +4947,7 @@ async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) 
     retrievedKnowledgeIds:inherited.map(x=>x.row.id),
     retrievalCount:inherited.length,
     boundaryClasses:inherited.map(x=>({knowledgeId:x.row.id,boundary:x.boundary,disposition:x.disposition,relevance:x.relevance})),
-    selectionPolicy:'quality-weighted-diverse-memory-v1',
+    selectionPolicy:'quality-weighted-diverse-memory-v2',
     rule:'Prior Hive memory guides research planning but never substitutes for current mission evidence. Self-memory and redundant objective echoes are excluded or suppressed; validated findings and mission completions are preferred over raw objective text.'
   };
   const id=`MRP-${crypto.randomUUID()}`;
