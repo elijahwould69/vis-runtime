@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.3-external-research-fabric",
+  version: "1.8.4-adaptive-research-engine",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -801,6 +801,20 @@ async function ensureSchema(env) {
       id TEXT PRIMARY KEY, run_id TEXT NOT NULL, parent_question_id TEXT NOT NULL, objective_id TEXT NOT NULL,
       venture_id TEXT NOT NULL, question TEXT NOT NULL, rationale TEXT, priority INTEGER DEFAULT 3,
       status TEXT DEFAULT 'queued', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS research_source_health (
+      source_id TEXT PRIMARY KEY, attempts INTEGER DEFAULT 0, successes INTEGER DEFAULT 0, failures INTEGER DEFAULT 0,
+      consecutive_failures INTEGER DEFAULT 0, last_status TEXT, last_error TEXT, last_attempt_at TEXT, last_success_at TEXT,
+      last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS research_attention_ledger (
+      id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, plan_id TEXT NOT NULL, run_id TEXT NOT NULL,
+      max_depth INTEGER DEFAULT 2, max_questions INTEGER DEFAULT 16, max_source_fetches INTEGER DEFAULT 48,
+      questions_used INTEGER DEFAULT 0, source_fetches_used INTEGER DEFAULT 0, duplicate_branches_suppressed INTEGER DEFAULT 0,
+      stop_reason TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS schema_migrations (
+      id TEXT PRIMARY KEY, version TEXT NOT NULL, description TEXT NOT NULL, applied_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`
   ];
 
@@ -808,8 +822,13 @@ async function ensureSchema(env) {
 
   for (const sql of [
     `ALTER TABLE operational_objectives ADD COLUMN venture_id TEXT DEFAULT 'PORTFOLIO'`,
-    `ALTER TABLE founder_decision_packages ADD COLUMN venture_id TEXT DEFAULT 'PORTFOLIO'`
+    `ALTER TABLE founder_decision_packages ADD COLUMN venture_id TEXT DEFAULT 'PORTFOLIO'`,
+    `ALTER TABLE mission_research_branches ADD COLUMN depth INTEGER DEFAULT 1`,
+    `ALTER TABLE mission_research_branches ADD COLUMN fingerprint TEXT`,
+    `ALTER TABLE mission_research_branches ADD COLUMN child_question_id TEXT`,
+    `ALTER TABLE mission_research_branches ADD COLUMN completed_at TEXT`
   ]) { try { await env.DB.prepare(sql).run(); } catch (_) {} }
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.4-001','1.8.4','Adaptive research recursion, source health, attention budgets, and evidence gates')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -4551,37 +4570,51 @@ function stripHTMLResearch(html){
   return cleanText(String(html||'').replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/\s+/g,' '),12000);
 }
 
-async function fetchResearchDocument(url){
-  try{
-    const r=await fetch(url,{headers:{'User-Agent':'VIS-Research/1.8.3 (+internal business research; zero-dollar)'}});
-    if(!r.ok) return null;
-    const ct=r.headers.get('content-type')||'';
-    const body=await r.text();
-    return {url,title:url,text:ct.includes('html')?stripHTMLResearch(body):cleanText(body,12000)};
-  }catch(_){ return null; }
+async function recordSourceHealth(env,sourceId,ok,error=''){
+  const now=nowISO();
+  await env.DB.prepare(`INSERT OR IGNORE INTO research_source_health (source_id,last_updated) VALUES (?,?)`).bind(sourceId,now).run();
+  if(ok) await env.DB.prepare(`UPDATE research_source_health SET attempts=attempts+1,successes=successes+1,consecutive_failures=0,last_status='healthy',last_error=NULL,last_attempt_at=?,last_success_at=?,last_updated=? WHERE source_id=?`).bind(now,now,now,sourceId).run();
+  else await env.DB.prepare(`UPDATE research_source_health SET attempts=attempts+1,failures=failures+1,consecutive_failures=consecutive_failures+1,last_status='degraded',last_error=?,last_attempt_at=?,last_updated=? WHERE source_id=?`).bind(cleanText(error,1000),now,now,sourceId).run();
+}
+
+async function fetchResearchDocument(env,sourceId,url){
+  let last='';
+  for(let attempt=1;attempt<=2;attempt++){
+    const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),7000);
+    try{
+      const r=await fetch(url,{headers:{'User-Agent':'VIS-Research/1.8.4 (+internal business research; zero-dollar)','Accept':'text/html,application/atom+xml,application/xml,text/plain;q=0.9,*/*;q=0.5'},signal:controller.signal});
+      clearTimeout(timer);
+      if(!r.ok){ last=`HTTP ${r.status}`; continue; }
+      const ct=r.headers.get('content-type')||''; const body=await r.text();
+      const text=ct.includes('html')?stripHTMLResearch(body):cleanText(body,12000);
+      if(!text||text.length<120){ last='empty-or-thin-document'; continue; }
+      await recordSourceHealth(env,sourceId,true);
+      return {url,title:url,text};
+    }catch(e){ clearTimeout(timer); last=cleanText(e?.message||String(e),500); }
+  }
+  await recordSourceHealth(env,sourceId,false,last||'fetch-failed');
+  return null;
 }
 
 function keywordsForResearch(q){
   const stop=new Set('what are the current key most potential how can does do for and with from into this that company dcc its these their where which who why when revenue increase opportunities industry industries market markets'.split(' '));
-  return String(q||'').toLowerCase().replace(/[^a-z0-9\s-]/g,' ').split(/\s+/).filter(x=>x.length>3&&!stop.has(x)).slice(0,7);
+  return String(q||'').toLowerCase().replace(/[^a-z0-9\s-]/g,' ').split(/\s+/).filter(x=>x.length>3&&!stop.has(x)).slice(0,9);
 }
 
-async function collectQuestionSources(env,qrow){
+async function collectQuestionSources(env,qrow,budget){
   let classes=[]; try{ classes=JSON.parse(qrow.source_classes||'[]'); }catch(_){}
-  const words=keywordsForResearch(qrow.question);
-  const docs=[];
-  const add=async(sourceId,sourceClass,name,url,quality)=>{ const d=await fetchResearchDocument(url); if(d&&d.text&&d.text.length>120) docs.push({...d,sourceId,sourceClass,name,quality}); };
+  const words=keywordsForResearch(qrow.question), docs=[];
+  const add=async(sourceId,sourceClass,name,url,quality)=>{
+    if(budget.fetches>=budget.maxFetches) return;
+    budget.fetches++;
+    const d=await fetchResearchDocument(env,sourceId,url);
+    if(d&&d.text) docs.push({...d,sourceId,sourceClass,name,quality});
+  };
   if(classes.some(x=>['procurement','municipal-procurement','customer-demand','competitor-pricing','industry-market'].includes(x))){
     const term=encodeURIComponent(words.join(' ')||'construction maintenance');
     await add('SRC-CANADABUYS','procurement','CanadaBuys',`https://canadabuys.canada.ca/en/tender-opportunities?current_tab=c&items_per_page=50&words=${term}`,1.0);
   }
-  const statcanMap={
-    'official-statistics':'https://www150.statcan.gc.ca/n1/rss/dai-quo/34-eng.atom',
-    'labour':'https://www150.statcan.gc.ca/n1/rss/dai-quo/14-eng.atom',
-    'trade-market':'https://www150.statcan.gc.ca/n1/rss/dai-quo/12-eng.atom',
-    'industry-market':'https://www150.statcan.gc.ca/n1/rss/dai-quo/33-eng.atom',
-    'technology-signal':'https://www150.statcan.gc.ca/n1/rss/dai-quo/27-eng.atom'
-  };
+  const statcanMap={'official-statistics':'https://www150.statcan.gc.ca/n1/rss/dai-quo/34-eng.atom','labour':'https://www150.statcan.gc.ca/n1/rss/dai-quo/14-eng.atom','trade-market':'https://www150.statcan.gc.ca/n1/rss/dai-quo/12-eng.atom','industry-market':'https://www150.statcan.gc.ca/n1/rss/dai-quo/33-eng.atom','technology-signal':'https://www150.statcan.gc.ca/n1/rss/dai-quo/27-eng.atom'};
   for(const c of [...new Set(classes)]) if(statcanMap[c]) await add(`SRC-STATCAN-${c}`,c,'Statistics Canada',statcanMap[c],1.0);
   if(classes.includes('regulatory')) await add('SRC-BC-GOV','regulatory','Government of British Columbia','https://www2.gov.bc.ca/gov/content/industry/construction-industry',.95);
   if(classes.includes('official-statistics')) await add('SRC-BCSTATS','official-statistics','BC Stats','https://www2.gov.bc.ca/gov/content/data/statistics',1.0);
@@ -4597,39 +4630,48 @@ async function persistResearchEvidence(env,{runId,planId,qrow,doc,text,relevance
   return id;
 }
 
-async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuestions=8}){
-  const runId=`MRUN-${crypto.randomUUID()}`;
+async function branchFingerprint(q){ return await researchFingerprint(String(q||'').toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim()); }
+
+async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuestions=8,maxDepth=2,maxTotalQuestions=16,maxSourceFetches=48}){
+  const runId=`MRUN-${crypto.randomUUID()}`, attentionId=`RAL-${crypto.randomUUID()}`;
   await env.DB.prepare(`INSERT INTO mission_research_runs (id,plan_id,objective_id,venture_id,status) VALUES (?,?,?,?, 'running')`).bind(runId,planId,objectiveId,ventureId).run();
-  const rows=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status='open' ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,maxQuestions).all()).results||[];
-  let answered=0,evidenceCount=0,branches=0;
-  for(const qrow of rows){
-    const docs=await collectQuestionSources(env,qrow);
-    if(!docs.length){ await env.DB.prepare(`UPDATE mission_research_questions SET status='research_required',answer_summary=?,last_updated=? WHERE id=?`).bind('No configured public source returned usable material.',nowISO(),qrow.id).run(); continue; }
+  await env.DB.prepare(`INSERT INTO research_attention_ledger (id,objective_id,plan_id,run_id,max_depth,max_questions,max_source_fetches) VALUES (?,?,?,?,?,?,?)`).bind(attentionId,objectiveId,planId,runId,maxDepth,maxTotalQuestions,maxSourceFetches).run();
+  const budget={fetches:0,maxFetches:maxSourceFetches}; let attempted=0,answered=0,evidenceCount=0,branches=0,dupes=0;
+  const processRow=async(qrow,depth)=>{
+    if(attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) return;
+    attempted++;
+    const docs=await collectQuestionSources(env,qrow,budget);
+    if(!docs.length){ await env.DB.prepare(`UPDATE mission_research_questions SET status='research_required',answer_summary=?,last_updated=? WHERE id=?`).bind('No configured public source returned usable material.',nowISO(),qrow.id).run(); return; }
     let parsed=null;
-    try{
-      const material=docs.map((d,i)=>`[${i}] ${d.name} | ${d.url}\n${d.text.slice(0,5000)}`).join('\n\n');
-      const raw=await think(env,RESEARCH_SPECIALIST_SYSTEM,`QUESTION: ${qrow.question}\nSOURCE MATERIAL:\n${material}`,1400,.15);
-      const m=String(raw||'').match(/\{[\s\S]*\}/); if(m) parsed=JSON.parse(m[0]);
-    }catch(_){}
+    try{ const material=docs.map((d,i)=>`[${i}] ${d.name} | ${d.url}\n${d.text.slice(0,5000)}`).join('\n\n'); const raw=await think(env,RESEARCH_SPECIALIST_SYSTEM,`QUESTION: ${qrow.question}\nSOURCE MATERIAL:\n${material}`,1400,.15); const m=String(raw||'').match(/\{[\s\S]*\}/); if(m) parsed=JSON.parse(m[0]); }catch(_){}
     if(!parsed) parsed={answer:'INSUFFICIENT: source specialist could not produce a validated answer.',confidence:0,evidence_indexes:[],gaps:['specialist-output-failure'],follow_up_questions:[]};
     const refs=[];
-    for(const idx of (Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[]).slice(0,4)){
-      const doc=docs[Number(idx)]; if(!doc) continue;
-      refs.push(await persistResearchEvidence(env,{runId,planId,qrow,doc,text:doc.text,relevance:Number(parsed.confidence||.5)})); evidenceCount++;
-    }
-    const conf=Math.max(0,Math.min(1,Number(parsed.confidence||0)));
-    const status=conf>=.55&&refs.length?'answered':'research_required';
-    if(status==='answered') answered++;
+    for(const idx of (Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[]).slice(0,4)){ const doc=docs[Number(idx)]; if(!doc) continue; const eid=await persistResearchEvidence(env,{runId,planId,qrow,doc,text:doc.text,relevance:Number(parsed.confidence||.5)}); if(!refs.includes(eid)) refs.push(eid); }
+    evidenceCount+=(new Set(refs)).size;
+    const conf=Math.max(0,Math.min(1,Number(parsed.confidence||0))), status=conf>=.55&&refs.length?'answered':'research_required'; if(status==='answered') answered++;
     await env.DB.prepare(`UPDATE mission_research_questions SET status=?,answer_summary=?,evidence_refs=?,last_updated=? WHERE id=?`).bind(status,cleanText(parsed.answer,5000),JSON.stringify(refs),nowISO(),qrow.id).run();
-    for(const fq of (Array.isArray(parsed.follow_up_questions)?parsed.follow_up_questions:[]).slice(0,2)){
-      if(!fq||String(fq).length<15) continue;
-      await env.DB.prepare(`INSERT INTO mission_research_branches (id,run_id,parent_question_id,objective_id,venture_id,question,rationale,priority,status) VALUES (?,?,?,?,?,?,?,?, 'queued')`).bind(`MRB-${crypto.randomUUID()}`,runId,qrow.id,objectiveId,ventureId,cleanText(fq,1200),`Generated from unresolved evidence gap in ${qrow.id}`,Math.max(1,researchPriority(qrow.priority)-1)).run(); branches++;
+    if(depth>=maxDepth) return;
+    for(const fq0 of (Array.isArray(parsed.follow_up_questions)?parsed.follow_up_questions:[]).slice(0,2)){
+      const fq=cleanText(fq0,1200); if(!fq||fq.length<15) continue; const fp=await branchFingerprint(fq);
+      const existing=await env.DB.prepare(`SELECT id FROM mission_research_branches WHERE objective_id=? AND fingerprint=? LIMIT 1`).bind(objectiveId,fp).first();
+      if(existing){ dupes++; continue; }
+      const bid=`MRB-${crypto.randomUUID()}`; await env.DB.prepare(`INSERT INTO mission_research_branches (id,run_id,parent_question_id,objective_id,venture_id,question,rationale,priority,status,depth,fingerprint) VALUES (?,?,?,?,?,?,?,?, 'queued',?,?)`).bind(bid,runId,qrow.id,objectiveId,ventureId,fq,`Generated from unresolved evidence gap in ${qrow.id}`,Math.max(1,researchPriority(qrow.priority)-1),depth+1,fp).run(); branches++;
+      if(attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) continue;
+      const childId=`MRQ-${crypto.randomUUID()}`; await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,?,'open',?)`).bind(childId,planId,objectiveId,ventureId,fq,qrow.source_classes||'[]',Math.max(1,researchPriority(qrow.priority)-1),nowISO()).run();
+      await env.DB.prepare(`UPDATE mission_research_branches SET status='executing',child_question_id=? WHERE id=?`).bind(childId,bid).run();
+      const child=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(childId).first(); await processRow(child,depth+1);
+      await env.DB.prepare(`UPDATE mission_research_branches SET status='completed',completed_at=? WHERE id=?`).bind(nowISO(),bid).run();
     }
-  }
-  const status=answered? 'completed':'research_required';
-  await env.DB.prepare(`UPDATE mission_research_runs SET status=?,questions_attempted=?,questions_answered=?,evidence_count=?,branches_created=?,completed_at=?,diagnostic=? WHERE id=?`).bind(status,rows.length,answered,evidenceCount,branches,nowISO(),answered?`Answered ${answered}/${rows.length} questions with persisted public-source evidence.`:'No research question reached evidence sufficiency.',runId).run();
+  };
+  const roots=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status='open' ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,maxQuestions).all()).results||[];
+  for(const q of roots){ if(attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) break; await processRow(q,0); }
+  const ratio=attempted?answered/attempted:0, sufficient=answered>=2&&evidenceCount>=2&&ratio>=.20;
+  const status=sufficient?'completed':'research_required';
+  const stopReason=budget.fetches>=budget.maxFetches?'source-fetch-budget':attempted>=maxTotalQuestions?'question-budget':sufficient?'evidence-sufficient':'evidence-insufficient';
+  await env.DB.prepare(`UPDATE mission_research_runs SET status=?,questions_attempted=?,questions_answered=?,evidence_count=?,branches_created=?,completed_at=?,diagnostic=? WHERE id=?`).bind(status,attempted,answered,evidenceCount,branches,nowISO(),`Evidence gate: ${answered}/${attempted} answered; ${evidenceCount} evidence refs; ${budget.fetches} source fetches; stop=${stopReason}.`,runId).run();
   await env.DB.prepare(`UPDATE mission_research_plans SET status=?,last_updated=? WHERE id=?`).bind(status,nowISO(),planId).run();
-  return {runId,status,questionsAttempted:rows.length,questionsAnswered:answered,evidenceCount,branchesCreated:branches};
+  await env.DB.prepare(`UPDATE research_attention_ledger SET questions_used=?,source_fetches_used=?,duplicate_branches_suppressed=?,stop_reason=?,last_updated=? WHERE id=?`).bind(attempted,budget.fetches,dupes,stopReason,nowISO(),attentionId).run();
+  return {runId,status,evidenceSufficient:sufficient,questionsAttempted:attempted,questionsAnswered:answered,evidenceCount,branchesCreated:branches,sourceFetches:budget.fetches,duplicateBranchesSuppressed:dupes,stopReason,attentionId};
 }
 
 async function getMissionResearchEvidence(env,objectiveId){
@@ -4638,7 +4680,9 @@ async function getMissionResearchEvidence(env,objectiveId){
   const questions=(await env.DB.prepare(`SELECT id,question,source_classes,priority,status,answer_summary,evidence_refs FROM mission_research_questions WHERE objective_id=? ORDER BY COALESCE(priority,3) DESC,created_at`).bind(objectiveId).all()).results||[];
   const evidence=(await env.DB.prepare(`SELECT id,question_id,source_class,source_name,source_url,title,relevance,source_quality,verification_status,retrieved_at FROM mission_research_evidence WHERE objective_id=? ORDER BY created_at`).bind(objectiveId).all()).results||[];
   const branches=(await env.DB.prepare(`SELECT * FROM mission_research_branches WHERE objective_id=? ORDER BY priority DESC,created_at`).bind(objectiveId).all()).results||[];
-  return {ok:true,run,questions,evidence,branches};
+  const attention=await env.DB.prepare(`SELECT * FROM research_attention_ledger WHERE objective_id=? ORDER BY created_at DESC LIMIT 1`).bind(objectiveId).first();
+  const sourceHealth=(await env.DB.prepare(`SELECT * FROM research_source_health ORDER BY source_id`).all()).results||[];
+  return {ok:true,run,questions,evidence,branches,attention,sourceHealth};
 }
 
 const EVIDENCE_CURATOR_SYSTEM=`
@@ -4714,7 +4758,13 @@ async function processOperationalObjective(env, objectiveId) {
     const seedObjective=await createHiveKnowledge(env,{knowledgeType:'founder-objective',subject:`Operational objective ${row.id}`,content:row.objective,confidence:1,verificationStatus:'founder-supplied',sourceType:'founder-intake',sourceRef:row.id});
     const seedPolicy=await createHiveKnowledge(env,{knowledgeType:'operating-policy',subject:'DCC operational authority boundary',content:'VIS may perform internal zero-dollar research, analysis, synthesis, worker coordination, recovery, and documentation. It may not contact prospects, submit bids, spend money, publish publicly, create consequential accounts, enter agreements, make payments, or make legal/compliance representations without explicit Founder approval. Unknown current facts must remain unknown until supported by evidence.',confidence:1,verificationStatus:'operating-policy',sourceType:'hive-policy',sourceRef:'V1.8.1'});
     const researchPlan=await createMissionResearchPlan(env,{objectiveId:row.id,ventureId,objective:row.objective});
-    const researchRun=await executeMissionResearch(env,{planId:researchPlan.id,objectiveId:row.id,ventureId,maxQuestions:8});
+    const researchRun=await executeMissionResearch(env,{planId:researchPlan.id,objectiveId:row.id,ventureId,maxQuestions:8,maxDepth:2,maxTotalQuestions:16,maxSourceFetches:48});
+    if(!researchRun.evidenceSufficient){
+      await env.DB.prepare(`UPDATE operational_objectives SET status='research_required',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
+      await env.DB.prepare(`UPDATE work_orders SET status='research_required',last_updated=? WHERE id=?`).bind(nowISO(),wo).run();
+      await audit(env,'ADAPTIVE_RESEARCH','EVIDENCE_GATE_HELD',wo,JSON.stringify({objectiveId:row.id,researchRun,externalSpendUSD:0}));
+      return {ok:true,objectiveId:row.id,workOrderId:wo,status:'research_required',researchRun,founderActionRequired:false,externalSpendUSD:0};
+    }
     const directResearch=(await env.DB.prepare(`SELECT question_id,source_name,source_url,title,evidence_text,relevance,source_quality,verification_status,retrieved_at FROM mission_research_evidence WHERE objective_id=? ORDER BY created_at LIMIT 30`).bind(row.id).all()).results||[];
     const recentEvidence=await env.DB.prepare(`SELECT source_name,item_url,title,evidence_text,verification_status,retrieved_at FROM evidence ORDER BY id DESC LIMIT 40`).all();
     const curatedEvidence=await curateMissionEvidence(env,{objective:row.objective,ventureId,researchPlan:researchPlan.plan,candidates:recentEvidence.results||[]});
