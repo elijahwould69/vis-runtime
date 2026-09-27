@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.5-research-reliability",
+  version: "1.8.6-quota-resilient-research",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -1365,6 +1365,15 @@ function extractAIText(result) {
   return "";
 }
 
+function classifyAIProviderError(error) {
+  const message=cleanText(error?.stack||error?.message||String(error),4000);
+  const lower=message.toLowerCase();
+  if(lower.includes('3036')||lower.includes('4006')||lower.includes('daily free allocation')||lower.includes('10,000 neurons')||lower.includes('10000 neurons')) return {kind:'provider_quota_exhausted',retryable:false,message};
+  if(lower.includes('3040')||lower.includes('out of capacity')||lower.includes('capacity temporarily exceeded')) return {kind:'provider_capacity',retryable:true,message};
+  if(lower.includes('subrequest')&&lower.includes('limit')) return {kind:'invocation_subrequest_limit',retryable:false,message};
+  return {kind:'ai_transient_or_unknown',retryable:true,message};
+}
+
 async function think(
   env,
   systemPrompt,
@@ -1384,7 +1393,13 @@ async function think(
       if(text) return text;
       errors.push(`attempt ${attempt}: no readable response`);
     } catch(error) {
-      errors.push(`attempt ${attempt}: ${error?.message||String(error)}`);
+      const provider=classifyAIProviderError(error);
+      errors.push(`attempt ${attempt} [${provider.kind}]: ${provider.message}`);
+      if(!provider.retryable) {
+        const terminal=new Error(`Workers AI terminal provider state: ${provider.kind}: ${provider.message}`);
+        terminal.providerState=provider.kind;
+        throw terminal;
+      }
     }
     if(attempt<3) await new Promise(r=>setTimeout(r,250*attempt));
   }
@@ -4649,7 +4664,7 @@ async function fetchResearchDocument(env,sourceId,url){
   for(let attempt=1;attempt<=2;attempt++){
     const controller=new AbortController(); const timer=setTimeout(()=>controller.abort(),7000);
     try{
-      const r=await fetch(url,{headers:{'User-Agent':'VIS-Research/1.8.5 (+internal business research; zero-dollar)','Accept':'text/html,application/atom+xml,application/xml,text/plain;q=0.9,*/*;q=0.5'},signal:controller.signal});
+      const r=await fetch(url,{headers:{'User-Agent':'VIS-Research/1.8.6 (+internal business research; zero-dollar)','Accept':'text/html,application/atom+xml,application/xml,text/plain;q=0.9,*/*;q=0.5'},signal:controller.signal});
       clearTimeout(timer);
       if(!r.ok){ last=`HTTP ${r.status}`; continue; }
       const ct=r.headers.get('content-type')||''; const body=await r.text();
@@ -4699,11 +4714,11 @@ async function persistResearchEvidence(env,{runId,planId,qrow,doc,text,relevance
 
 async function branchFingerprint(q){ return await researchFingerprint(String(q||'').toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim()); }
 
-async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuestions=8,maxDepth=2,maxTotalQuestions=16,maxSourceFetches=48}){
+async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuestions=8,maxDepth=2,maxTotalQuestions=16,maxSourceFetches=20}){
   const runId=`MRUN-${crypto.randomUUID()}`, attentionId=`RAL-${crypto.randomUUID()}`;
   await env.DB.prepare(`INSERT INTO mission_research_runs (id,plan_id,objective_id,venture_id,status) VALUES (?,?,?,?, 'running')`).bind(runId,planId,objectiveId,ventureId).run();
   await env.DB.prepare(`INSERT INTO research_attention_ledger (id,objective_id,plan_id,run_id,max_depth,max_questions,max_source_fetches) VALUES (?,?,?,?,?,?,?)`).bind(attentionId,objectiveId,planId,runId,maxDepth,maxTotalQuestions,maxSourceFetches).run();
-  const budget={fetches:0,maxFetches:maxSourceFetches}; let attempted=0,answered=0,evidenceCount=0,branches=0,dupes=0;
+  const budget={fetches:0,maxFetches:Math.min(20,maxSourceFetches)}; let attempted=0,answered=0,evidenceCount=0,branches=0,dupes=0,providerState=null;
   const processRow=async(qrow,depth)=>{
     if(attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) return;
     attempted++;
@@ -4717,12 +4732,27 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
       await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'parse-and-validate',status:'validated',raw:specialistRaw,parsed});
     }catch(error){
       specialistError=cleanText(error?.stack||error?.message||String(error),3000);
+      const provider=classifyAIProviderError(error);
+      if(error?.providerState==='provider_quota_exhausted'||provider.kind==='provider_quota_exhausted'){
+        providerState='provider_quota_exhausted';
+        try{ await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'provider',status:'paused',error:specialistError,raw:specialistRaw}); }catch(_){}
+        try{ await audit(env,'JANITOR','AI_PROVIDER_QUOTA_CHECKPOINT',qrow.id,JSON.stringify({objectiveId,runId,providerState,action:'checkpoint-and-resume-later',externalSpendUSD:0})); }catch(_){}
+        await env.DB.prepare(`UPDATE mission_research_questions SET status='open',answer_summary=?,last_updated=? WHERE id=?`).bind('Paused: Workers AI daily free allocation exhausted. Research checkpoint preserved for automatic retry.',nowISO(),qrow.id).run();
+        return;
+      }
+      if(error?.providerState==='invocation_subrequest_limit'||provider.kind==='invocation_subrequest_limit'){
+        providerState='invocation_subrequest_limit';
+        try{ await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'provider',status:'paused',error:specialistError,raw:specialistRaw}); }catch(_){}
+        await env.DB.prepare(`UPDATE mission_research_questions SET status='open',answer_summary=?,last_updated=? WHERE id=?`).bind('Paused: invocation subrequest ceiling reached. Research checkpoint preserved.',nowISO(),qrow.id).run();
+        return;
+      }
       try{ await recordResearchSpecialistDiagnostic(env,{runId,planId,qrow,attempt:1,stage:'parse-and-validate',status:'failed',error:specialistError,raw:specialistRaw}); }catch(_){}
       try{ await recordFailure(env,runId,`research-specialist:${qrow.id}`,error); }catch(_){}
       try{ await audit(env,'JANITOR','RESEARCH_SPECIALIST_DIAGNOSIS',qrow.id,JSON.stringify({objectiveId,qrow:qrow.id,error:specialistError})); }catch(_){}
       const fallback=deterministicEvidenceGapQuestions(qrow,docs,specialistError);
       parsed={answer:`INSUFFICIENT: research specialist output failed validation. ${cleanText(specialistError,1200)}`,confidence:0,evidence_indexes:[],gaps:[fallback.gap],follow_up_questions:fallback.questions};
     }
+    if(providerState) return;
     const refs=[];
     for(const idx of (Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[]).slice(0,4)){ const doc=docs[Number(idx)]; if(!doc) continue; const eid=await persistResearchEvidence(env,{runId,planId,qrow,doc,text:doc.text,relevance:Number(parsed.confidence||.5)}); if(!refs.includes(eid)) refs.push(eid); }
     evidenceCount+=(new Set(refs)).size;
@@ -4742,14 +4772,14 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
     }
   };
   const roots=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status='open' ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,maxQuestions).all()).results||[];
-  for(const q of roots){ if(attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) break; await processRow(q,0); }
-  const ratio=attempted?answered/attempted:0, sufficient=answered>=2&&evidenceCount>=2&&ratio>=.20;
-  const status=sufficient?'completed':'research_required';
-  const stopReason=budget.fetches>=budget.maxFetches?'source-fetch-budget':attempted>=maxTotalQuestions?'question-budget':sufficient?'evidence-sufficient':'evidence-insufficient';
+  for(const q of roots){ if(providerState||attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) break; await processRow(q,0); }
+  const ratio=attempted?answered/attempted:0, sufficient=!providerState&&answered>=2&&evidenceCount>=2&&ratio>=.20;
+  const status=providerState|| (sufficient?'completed':'research_required');
+  const stopReason=providerState|| (budget.fetches>=budget.maxFetches?'source-fetch-budget':attempted>=maxTotalQuestions?'question-budget':sufficient?'evidence-sufficient':'evidence-insufficient');
   await env.DB.prepare(`UPDATE mission_research_runs SET status=?,questions_attempted=?,questions_answered=?,evidence_count=?,branches_created=?,completed_at=?,diagnostic=? WHERE id=?`).bind(status,attempted,answered,evidenceCount,branches,nowISO(),`Evidence gate: ${answered}/${attempted} answered; ${evidenceCount} evidence refs; ${budget.fetches} source fetches; stop=${stopReason}.`,runId).run();
   await env.DB.prepare(`UPDATE mission_research_plans SET status=?,last_updated=? WHERE id=?`).bind(status,nowISO(),planId).run();
   await env.DB.prepare(`UPDATE research_attention_ledger SET questions_used=?,source_fetches_used=?,duplicate_branches_suppressed=?,stop_reason=?,last_updated=? WHERE id=?`).bind(attempted,budget.fetches,dupes,stopReason,nowISO(),attentionId).run();
-  return {runId,status,evidenceSufficient:sufficient,questionsAttempted:attempted,questionsAnswered:answered,evidenceCount,branchesCreated:branches,sourceFetches:budget.fetches,duplicateBranchesSuppressed:dupes,stopReason,attentionId};
+  return {runId,status,evidenceSufficient:sufficient,providerState,questionsAttempted:attempted,questionsAnswered:answered,evidenceCount,branchesCreated:branches,sourceFetches:budget.fetches,duplicateBranchesSuppressed:dupes,stopReason,attentionId};
 }
 
 async function getMissionResearchEvidence(env,objectiveId){
@@ -4836,8 +4866,15 @@ async function processOperationalObjective(env, objectiveId) {
     await env.DB.prepare(`UPDATE work_orders SET status='running',started_at=COALESCE(started_at,?),last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),wo).run();
     const seedObjective=await createHiveKnowledge(env,{knowledgeType:'founder-objective',subject:`Operational objective ${row.id}`,content:row.objective,confidence:1,verificationStatus:'founder-supplied',sourceType:'founder-intake',sourceRef:row.id});
     const seedPolicy=await createHiveKnowledge(env,{knowledgeType:'operating-policy',subject:'DCC operational authority boundary',content:'VIS may perform internal zero-dollar research, analysis, synthesis, worker coordination, recovery, and documentation. It may not contact prospects, submit bids, spend money, publish publicly, create consequential accounts, enter agreements, make payments, or make legal/compliance representations without explicit Founder approval. Unknown current facts must remain unknown until supported by evidence.',confidence:1,verificationStatus:'operating-policy',sourceType:'hive-policy',sourceRef:'V1.8.1'});
-    const researchPlan=await createMissionResearchPlan(env,{objectiveId:row.id,ventureId,objective:row.objective});
-    const researchRun=await executeMissionResearch(env,{planId:researchPlan.id,objectiveId:row.id,ventureId,maxQuestions:8,maxDepth:2,maxTotalQuestions:16,maxSourceFetches:48});
+    const existingResearchPlan=await env.DB.prepare(`SELECT * FROM mission_research_plans WHERE objective_id=? ORDER BY created_at DESC LIMIT 1`).bind(row.id).first();
+    const researchPlan=existingResearchPlan?{id:existingResearchPlan.id,plan:(()=>{try{return JSON.parse(existingResearchPlan.plan||'{}')}catch{return {}}})()}:await createMissionResearchPlan(env,{objectiveId:row.id,ventureId,objective:row.objective});
+    const researchRun=await executeMissionResearch(env,{planId:researchPlan.id,objectiveId:row.id,ventureId,maxQuestions:8,maxDepth:2,maxTotalQuestions:16,maxSourceFetches:20});
+    if(researchRun.providerState){
+      await env.DB.prepare(`UPDATE operational_objectives SET status='research_paused',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
+      await env.DB.prepare(`UPDATE work_orders SET status='research_paused',last_updated=? WHERE id=?`).bind(nowISO(),wo).run();
+      await audit(env,'ADAPTIVE_RESEARCH','PROVIDER_CHECKPOINT',wo,JSON.stringify({objectiveId:row.id,researchRun,externalSpendUSD:0}));
+      return {ok:true,objectiveId:row.id,workOrderId:wo,status:'research_paused',researchRun,founderActionRequired:false,externalSpendUSD:0};
+    }
     if(!researchRun.evidenceSufficient){
       await env.DB.prepare(`UPDATE operational_objectives SET status='research_required',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
       await env.DB.prepare(`UPDATE work_orders SET status='research_required',last_updated=? WHERE id=?`).bind(nowISO(),wo).run();
@@ -4911,7 +4948,7 @@ async function intakeOperationalObjective(env, request) {
 
 async function continueOperationalQueue(env) {
   await ensureSchema(env);
-  const next=await env.DB.prepare(`SELECT id FROM operational_objectives WHERE status='queued' ORDER BY priority DESC,created_at ASC LIMIT 1`).first();
+  const next=await env.DB.prepare(`SELECT id FROM operational_objectives WHERE status='queued' OR (status='research_paused' AND datetime(last_updated)<=datetime('now','-60 minutes')) ORDER BY priority DESC,created_at ASC LIMIT 1`).first();
   if(!next) return {ok:true,processed:false};
   return await processOperationalObjective(env,next.id);
 }
