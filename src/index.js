@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.28-objective-lifecycle-learning-closure",
+  version: "1.8.29-institutional-learning-retrieval-reuse",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -910,6 +910,13 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.26-001','1.8.26','Constraint-Aware Candidate Search: canonical procurement candidates are evaluated independently; locked mismatches remain valid Hive evidence while the bounded research run continues through later candidates until a mission match is found or the candidate budget is exhausted')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.27-001','1.8.27','Mission Completion Propagation: a qualified mission-matched transaction propagates terminal success to the parent research plan and operational objective; residual unanswered research is retained as non-blocking Hive learning')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.28-001','1.8.28','Objective Lifecycle and Learning Closure: terminal objectives transition to completed lifecycle state; residual learning is detached into Hive knowledge; completed objectives are permanently excluded from continuation')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.29-001','1.8.29','Institutional Learning Retrieval and Reuse: new missions retrieve relevant active Hive knowledge with provenance, venture-boundary classification, and bounded reuse packets before research planning')`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mission_knowledge_retrievals (
+    id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, knowledge_id TEXT NOT NULL,
+    relevance REAL DEFAULT 0, boundary_class TEXT NOT NULL, reuse_disposition TEXT NOT NULL,
+    rationale TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )`).run();
+  await env.DB.prepare(`CREATE INDEX IF NOT EXISTS idx_mkr_objective ON mission_knowledge_retrievals(objective_id,created_at)`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -4799,9 +4806,58 @@ Prioritize direct evidence capable of changing a business decision. Unfamiliar i
 For opportunity-discovery missions, the program must seek evidence for these commercial dimensions before graduation: named buyer/customer, painful problem, concrete offer, demand/purchasing evidence, competitors/substitutes, pricing/unit economics, operational requirements, material risks, and learnability/advantage. Generic sector growth or market statistics are context, not an opportunity by themselves.
 `;
 
+
+function learningTokens(text){
+  const stop=new Set(['the','and','for','with','that','this','from','into','one','are','was','were','will','should','could','would','have','has','had','not','but','its','our','your','their','they','them','then','than','when','where','what','which','who','how','why','mission','objective','research','find','current','using','used','use','zero','dollar','internal']);
+  return [...new Set(String(text||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').split(/\s+/).filter(x=>x.length>=3&&!stop.has(x)))].slice(0,80);
+}
+
+function knowledgeVentureBoundary(row,ventureId){
+  const content=String(row?.content||'');
+  let parsed=null; try{parsed=JSON.parse(content);}catch(_){}
+  const tagged=parsed?.ventureId||parsed?.sourceVentureId||null;
+  if(!tagged) return 'generalizable';
+  return tagged===ventureId?'same-venture':'cross-venture';
+}
+
+async function retrieveInstitutionalLearning(env,{objectiveId,ventureId,objective}){
+  const rows=await env.DB.prepare(`SELECT id,knowledge_type,subject,content,confidence,verification_status,source_type,source_ref,created_at
+    FROM hive_knowledge WHERE status='active' ORDER BY confidence DESC,created_at DESC LIMIT 250`).all();
+  const missionTokens=learningTokens(objective);
+  const scored=[];
+  for(const row of (rows.results||[])){
+    const hay=learningTokens(`${row.subject||''} ${row.content||''}`);
+    const hs=new Set(hay);
+    const overlap=missionTokens.filter(t=>hs.has(t));
+    let relevance=missionTokens.length?overlap.length/Math.min(missionTokens.length,20):0;
+    if(row.knowledge_type==='mission-completion') relevance+=0.08;
+    if(row.verification_status==='terminal-condition-satisfied') relevance+=0.08;
+    const boundary=knowledgeVentureBoundary(row,ventureId);
+    const disposition=boundary==='cross-venture'?'context-only':'reusable';
+    if(relevance<0.08) continue;
+    scored.push({row,relevance:Math.min(1,relevance),boundary,disposition,overlap});
+  }
+  scored.sort((a,b)=>b.relevance-a.relevance||Number(b.row.confidence||0)-Number(a.row.confidence||0));
+  const selected=scored.slice(0,12);
+  for(const x of selected){
+    await env.DB.prepare(`INSERT INTO mission_knowledge_retrievals
+      (id,objective_id,venture_id,knowledge_id,relevance,boundary_class,reuse_disposition,rationale)
+      VALUES (?,?,?,?,?,?,?,?)`).bind(`MKR-${crypto.randomUUID()}`,objectiveId,ventureId,x.row.id,x.relevance,x.boundary,x.disposition,
+        cleanText(`Token overlap: ${x.overlap.slice(0,12).join(', ')||'semantic mission context'}; boundary=${x.boundary}. Cross-venture knowledge is context only and must not substitute for venture-specific evidence.`,2000)).run();
+  }
+  await audit(env,'HIVE_MEMORY','INSTITUTIONAL_LEARNING_RETRIEVED',objectiveId,JSON.stringify({
+    objectiveId,ventureId,candidatesConsidered:(rows.results||[]).length,selected:selected.length,
+    knowledgeIds:selected.map(x=>x.row.id),boundaryClasses:selected.map(x=>x.boundary),
+    externalSpendUSD:0
+  }));
+  return selected;
+}
+
 async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) {
   const venture=await env.DB.prepare(`SELECT * FROM ventures WHERE id=?`).bind(ventureId).first();
-  const prompt=`VENTURE: ${venture?.name||ventureId}\nVENTURE CONTEXT: ${venture?.context||'No additional context.'}\nMISSION: ${objective}\nDesign mission-directed eyes-and-ears research before opportunity synthesis.`;
+  const inherited=await retrieveInstitutionalLearning(env,{objectiveId,ventureId,objective});
+  const memoryPacket=inherited.map((x,i)=>`[${i}] ${x.row.id} | ${x.row.knowledge_type} | boundary=${x.boundary} | disposition=${x.disposition} | confidence=${x.row.confidence}\nSUBJECT: ${x.row.subject}\nCONTENT: ${String(x.row.content||'').slice(0,1800)}`).join('\n\n');
+  const prompt=`VENTURE: ${venture?.name||ventureId}\nVENTURE CONTEXT: ${venture?.context||'No additional context.'}\nMISSION: ${objective}\n\nRELEVANT HIVE MEMORY:\n${memoryPacket||'No sufficiently relevant prior Hive knowledge retrieved.'}\n\nDesign mission-directed eyes-and-ears research before opportunity synthesis. Use relevant prior knowledge to identify what is already known and what remains uncertain. Never treat cross-venture context as proof for this venture. Never let prior memory override newer direct evidence. Research unresolved or stale claims rather than blindly repeating old work.`;
   let parsed=null;
   try {
     const raw=await think(env,RESEARCH_DIRECTOR_SYSTEM,prompt,1200,.25);
@@ -4815,6 +4871,12 @@ async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) 
     {question:'What competitors, substitutes, pricing, and delivery models exist?',source_classes:['competitor-pricing','industry-market'],priority:4,why_it_matters:'Tests economics and differentiation.'},
     {question:'What operational, regulatory, supply-chain, or capability constraints could kill the venture?',source_classes:['regulatory','supply-chain'],priority:4,why_it_matters:'Prevents attractive but infeasible conclusions.'}
   ]};
+  parsed.institutional_memory={
+    retrievedKnowledgeIds:inherited.map(x=>x.row.id),
+    retrievalCount:inherited.length,
+    boundaryClasses:inherited.map(x=>({knowledgeId:x.row.id,boundary:x.boundary,disposition:x.disposition,relevance:x.relevance})),
+    rule:'Prior Hive memory guides research planning but never substitutes for current mission evidence.'
+  };
   const id=`MRP-${crypto.randomUUID()}`;
   await env.DB.prepare(`INSERT INTO mission_research_plans (id,objective_id,venture_id,research_goal,plan_json,status,last_updated) VALUES (?,?,?,?,?,'active',?)`).bind(id,objectiveId,ventureId,cleanText(parsed.research_goal,2000),JSON.stringify(parsed),nowISO()).run();
   for(const q of parsed.questions.slice(0,8)) await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,?,'open',?)`).bind(`MRQ-${crypto.randomUUID()}`,id,objectiveId,ventureId,cleanText(q.question,1200),JSON.stringify(q.source_classes||[]),Math.max(1,Math.min(5,typeof q.priority==='string'?({low:2,medium:3,high:5,critical:5}[q.priority.toLowerCase()]||3):Number(q.priority||3))),nowISO()).run();
