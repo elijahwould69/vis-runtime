@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.17-transaction-discovery-stage",
+  version: "1.8.19-crash-safe-transaction-discovery",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -5166,13 +5166,17 @@ async function ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,v
   const state=await getResearchDependencyState(env,planId);
   if(state.ready.buyer) return {buyerReady:true,question:null,created:false};
   const marker='Which current British Columbia public-sector purchasing transaction';
-  let row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND question LIKE ? ORDER BY created_at DESC LIMIT 1`).bind(planId,`${marker}%`).first();
+  // V1.8.19: D1-safe stage lookup. Avoid LIKE/GLOB entirely; a bound pattern on the
+  // accumulated legacy question set triggered SQLITE "pattern too complex" in production.
+  // Pull the small plan-local candidate set and perform the prefix match deterministically in JS.
+  const stageCandidates=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? ORDER BY created_at DESC`).bind(planId).all();
+  let row=(stageCandidates.results||[]).find(candidate=>String(candidate.question||'').startsWith(marker))||null;
   if(!row){
     const id=`MRQ-${crypto.randomUUID()}`;
     const question=`Which current British Columbia public-sector purchasing transaction provides direct evidence of a named buyer organization, a concrete purchased scope, and an observable procurement mechanism? Search actual tenders, awards, purchase opportunities, or public contract records across multiple service and supply categories. Do not search for ${objectiveId} as a product, category, code, or budget item.`;
     await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,5,'open',?)`).bind(id,planId,objectiveId,ventureId,question,JSON.stringify(['procurement','municipal-procurement','customer-demand']),nowISO()).run();
     row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(id).first();
-    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.17',legacyQueueBypassed:true,externalSpendUSD:0}));
+    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.19',legacyQueueBypassed:true,externalSpendUSD:0}));
     return {buyerReady:false,question:row,created:true};
   }
   if(row.status==='answered'&&row.evidence_refs&&row.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(row.answer_summary||''))) return {buyerReady:true,question:row,created:false};
@@ -5594,7 +5598,47 @@ async function continueOperationalQueue(env) {
   `).bind(next.id).run();
   if((claimed.meta?.changes||0)!==1) return {ok:true,processed:false,reason:'queue-claim-lost'};
 
-  const result=await processOperationalObjective(env,next.id);
+  let result;
+  try {
+    result=await processOperationalObjective(env,next.id);
+  } catch(error) {
+    // V1.8.18: a continuation is earned only by a completed orchestration attempt.
+    // If processing throws, return the claimed slot, restore a recoverable state,
+    // persist the failure, and fail closed without silently consuming scarce lifecycle.
+    await env.DB.prepare(`
+      UPDATE operational_objectives
+      SET continuation_count=CASE WHEN COALESCE(continuation_count,0)>0 THEN continuation_count-1 ELSE 0 END,
+          status='research_required',
+          lifecycle_state='active',
+          retired_reason=NULL,
+          last_updated=?
+      WHERE id=?
+    `).bind(nowISO(),next.id).run().catch(()=>{});
+    await env.DB.prepare(`
+      UPDATE work_orders
+      SET status='research_required',completed_at=NULL,last_updated=?
+      WHERE id=(SELECT work_order_id FROM operational_objectives WHERE id=?)
+    `).bind(nowISO(),next.id).run().catch(()=>{});
+    await recordFailure(env,next.id,'continuation-orchestration',error).catch(()=>{});
+    await audit(env,'JANITOR','CONTINUATION_CLAIM_ROLLED_BACK',next.id,JSON.stringify({
+      objectiveId:next.id,
+      failedClaimCount:Number(next.continuation_count||0)+1,
+      restoredContinuationCount:Number(next.continuation_count||0),
+      recoveryState:'research_required',
+      error:cleanText(error?.message||String(error),1200),
+      externalSpendUSD:0
+    })).catch(()=>{});
+    return {
+      ok:false,
+      processed:false,
+      objectiveId:next.id,
+      status:'research_required',
+      continuationRolledBack:true,
+      continuationCount:Number(next.continuation_count||0),
+      error:cleanText(error?.message||String(error),1200),
+      externalSpendUSD:0
+    };
+  }
   const post=await env.DB.prepare(`
     SELECT id,status,lifecycle_state,continuation_count,continuation_limit
     FROM operational_objectives WHERE id=?
