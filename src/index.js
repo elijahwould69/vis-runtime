@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.22-procurement-detail-discovery",
+  version: "1.8.23-detail-evidence-bridge",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -901,6 +901,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.20-001','1.8.20','Transaction evidence extraction: field-level provenance, fail-closed transaction qualification, and gap-directed follow-up research')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.21-001','1.8.21','Transaction identity lock: candidate discovery is separated from transaction evidence; critical fields must converge on one canonical procurement record before qualification')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.22-001','1.8.22','Procurement detail-page discovery: search pages discover candidates; bounded source adapters resolve and fetch individual procurement records before identity qualification; acceptance missions quarantined from cron continuation')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.23-001','1.8.23','Detail Evidence Bridge: canonical procurement detail records bypass broad-page specialist gating and feed transaction extraction directly; identity lock remains fail-closed')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -5412,7 +5413,7 @@ async function ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,v
     const question=`Which current British Columbia public-sector purchasing transaction provides direct evidence of a named buyer organization, a concrete purchased scope, and an observable procurement mechanism? Search actual tenders, awards, purchase opportunities, or public contract records across multiple service and supply categories. Do not search for ${objectiveId} as a product, category, code, or budget item.`;
     await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,5,'open',?)`).bind(id,planId,objectiveId,ventureId,question,JSON.stringify(['procurement','municipal-procurement','customer-demand']),nowISO()).run();
     row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(id).first();
-    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.22',legacyQueueBypassed:true,externalSpendUSD:0}));
+    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.23',legacyQueueBypassed:true,externalSpendUSD:0}));
     return {buyerReady:false,question:row,created:true};
   }
   if(row.status==='answered'&&row.evidence_refs&&row.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(row.answer_summary||''))){
@@ -5484,12 +5485,23 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
     if(providerState) return;
     const refs=[];
     for(const idx of (Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[]).slice(0,4)){ const doc=docs[Number(idx)]; if(!doc) continue; const eid=await persistResearchEvidence(env,{runId,planId,qrow,doc,text:doc.text,relevance:Number(parsed.confidence||.5)}); if(!refs.includes(eid)) refs.push(eid); }
-    evidenceCount+=(new Set(refs)).size;
     const conf=Math.max(0,Math.min(1,Number(parsed.confidence||0)));
     const isTransactionStage=String(qrow.question||'').startsWith('Which current British Columbia public-sector purchasing transaction');
     let transactionExtraction=null;
-    if(isTransactionStage && conf>=.55 && refs.length){
-      transactionExtraction=await extractAndPersistTransactionEvidence(env,{runId,planId,qrow,docs});
+    if(isTransactionStage){
+      // V1.8.23 Detail Evidence Bridge: V1.8.22 proved that individual CanadaBuys
+      // records were fetched successfully, but the general research specialist could
+      // return INSUFFICIENT before transaction extraction ever saw them. For this
+      // dedicated stage, canonical detail records are the evidence boundary and feed
+      // the transaction extractor directly. Broad search/list pages are excluded.
+      const canonicalDocs=docs.filter(d=>transactionSourceIsCanonical(d?.url));
+      try{ await audit(env,'ADAPTIVE_RESEARCH','DETAIL_EVIDENCE_BRIDGE',qrow.objective_id,JSON.stringify({objectiveId:qrow.objective_id,runId,questionId:qrow.id,totalDocs:docs.length,canonicalDocs:canonicalDocs.length,canonicalUrls:canonicalDocs.map(d=>d.url).slice(0,8),specialistConfidence:conf,specialistEvidenceIndexes:Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[],externalSpendUSD:0})); }catch(_){}
+      if(canonicalDocs.length){
+        transactionExtraction=await extractAndPersistTransactionEvidence(env,{runId,planId,qrow,docs:canonicalDocs});
+        for(const eid of (transactionExtraction?.sourceEvidenceIds||[])) if(!refs.includes(eid)) refs.push(eid);
+      } else {
+        transactionExtraction={qualified:false,status:'candidate_unresolved',missingFields:['transaction_identity'],id:null,sourceEvidenceIds:[]};
+      }
       if(transactionExtraction && !transactionExtraction.qualified){
         const txGapQuestions=[];
         if(transactionExtraction.missingFields.includes('buyer_name')) txGapQuestions.push('Which named purchasing organization is explicitly identified in the transaction record, and what primary transaction document proves it?');
@@ -5498,7 +5510,10 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
         parsed.follow_up_questions=[...txGapQuestions,...(parsed.follow_up_questions||[])].slice(0,2);
       }
     }
-    const status=conf>=.55&&refs.length&&(!isTransactionStage||transactionExtraction?.qualified)?'answered':'research_required'; if(status==='answered') answered++;
+    evidenceCount+=(new Set(refs)).size;
+    const status=isTransactionStage
+      ?(transactionExtraction?.qualified&&refs.length?'answered':'research_required')
+      :(conf>=.55&&refs.length?'answered':'research_required'); if(status==='answered') answered++;
     const answerSummary=isTransactionStage&&!transactionExtraction?.qualified
       ?`INSUFFICIENT: transaction extraction did not establish verified buyer + concrete purchased scope + procurement identifier/mechanism. Missing: ${(transactionExtraction?.missingFields||['transaction_evidence']).join(', ')}.`
       :cleanText(parsed.answer,5000);
