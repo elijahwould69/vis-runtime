@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.8-opportunity-evidence-contract",
+  version: "1.8.9-research-continuation-recovery",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -4868,15 +4868,20 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
       await env.DB.prepare(`UPDATE mission_research_branches SET status='completed',completed_at=? WHERE id=?`).bind(nowISO(),bid).run();
     }
   };
-  const roots=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status='open' ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,maxQuestions).all()).results||[];
+  const roots=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status IN ('open','research_required') ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,maxQuestions).all()).results||[];
   for(const q of roots){ if(providerState||attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) break; await processRow(q,0); }
-  const ratio=attempted?answered/attempted:0, sufficient=!providerState&&answered>=2&&evidenceCount>=2&&ratio>=.20;
+  const unresolvedRow=await env.DB.prepare(`SELECT COUNT(*) AS n FROM mission_research_questions WHERE plan_id=? AND status IN ('open','research_required')`).bind(planId).first();
+  const queuedBranchRow=await env.DB.prepare(`SELECT COUNT(*) AS n FROM mission_research_branches WHERE objective_id=? AND status='queued'`).bind(objectiveId).first();
+  const unresolvedQuestions=Number(unresolvedRow?.n||0), queuedBranches=Number(queuedBranchRow?.n||0);
+  const budgetExhausted=budget.fetches>=budget.maxFetches||attempted>=maxTotalQuestions;
+  const continuationRequired=!providerState&&budgetExhausted&&(unresolvedQuestions>0||queuedBranches>0);
+  const ratio=attempted?answered/attempted:0, sufficient=!providerState&&!continuationRequired&&answered>=2&&evidenceCount>=2&&ratio>=.20;
   const status=providerState|| (sufficient?'completed':'research_required');
-  const stopReason=providerState|| (budget.fetches>=budget.maxFetches?'source-fetch-budget':attempted>=maxTotalQuestions?'question-budget':sufficient?'evidence-sufficient':'evidence-insufficient');
+  const stopReason=providerState|| (continuationRequired?'research-continuation-required':budget.fetches>=budget.maxFetches?'source-fetch-budget':attempted>=maxTotalQuestions?'question-budget':sufficient?'evidence-sufficient':'evidence-insufficient');
   await env.DB.prepare(`UPDATE mission_research_runs SET status=?,questions_attempted=?,questions_answered=?,evidence_count=?,branches_created=?,completed_at=?,diagnostic=? WHERE id=?`).bind(status,attempted,answered,evidenceCount,branches,nowISO(),`Evidence gate: ${answered}/${attempted} answered; ${evidenceCount} evidence refs; ${budget.fetches} source fetches; stop=${stopReason}.`,runId).run();
   await env.DB.prepare(`UPDATE mission_research_plans SET status=?,last_updated=? WHERE id=?`).bind(status,nowISO(),planId).run();
   await env.DB.prepare(`UPDATE research_attention_ledger SET questions_used=?,source_fetches_used=?,duplicate_branches_suppressed=?,stop_reason=?,last_updated=? WHERE id=?`).bind(attempted,budget.fetches,dupes,stopReason,nowISO(),attentionId).run();
-  return {runId,status,evidenceSufficient:sufficient,providerState,questionsAttempted:attempted,questionsAnswered:answered,evidenceCount,branchesCreated:branches,sourceFetches:budget.fetches,duplicateBranchesSuppressed:dupes,stopReason,attentionId};
+  return {runId,status,evidenceSufficient:sufficient,continuationRequired,unresolvedQuestions,queuedBranches,providerState,questionsAttempted:attempted,questionsAnswered:answered,evidenceCount,branchesCreated:branches,sourceFetches:budget.fetches,duplicateBranchesSuppressed:dupes,stopReason,attentionId};
 }
 
 async function getMissionResearchEvidence(env,objectiveId){
@@ -5032,7 +5037,12 @@ async function processOperationalObjective(env, objectiveId) {
   if(!row) throw new Error('Operational objective not found.');
   assertInternalAuthority(row.authority_scope);
   if(row.status==='completed') return {ok:true,alreadyCompleted:true,objectiveId:row.id,workOrderId:row.work_order_id,decisionPackageId:row.decision_package_id};
-  if(row.status==='running') return {ok:true,alreadyRunning:true,objectiveId:row.id,workOrderId:row.work_order_id};
+  if(row.status==='running') {
+    const last=Date.parse(row.last_updated||row.started_at||'');
+    const stale=!Number.isFinite(last)||(Date.now()-last)>=30*60*1000;
+    if(!stale) return {ok:true,alreadyRunning:true,objectiveId:row.id,workOrderId:row.work_order_id};
+    await audit(env,'JANITOR','STALE_OPERATIONAL_OBJECTIVE_RECOVERY',row.work_order_id||row.id,JSON.stringify({objectiveId:row.id,lastUpdated:row.last_updated,recovery:'resume-from-persisted-state',externalSpendUSD:0}));
+  }
   const ventureId=cleanText(row.venture_id,120)||'PORTFOLIO';
   const wo=row.work_order_id||`${ventureId}-WO-${crypto.randomUUID()}`;
   try {
@@ -5138,7 +5148,7 @@ async function intakeOperationalObjective(env, request) {
 
 async function continueOperationalQueue(env) {
   await ensureSchema(env);
-  const next=await env.DB.prepare(`SELECT id FROM operational_objectives WHERE status='queued' OR (status='research_paused' AND datetime(last_updated)<=datetime('now','-60 minutes')) ORDER BY priority DESC,created_at ASC LIMIT 1`).first();
+  const next=await env.DB.prepare(`SELECT id FROM operational_objectives WHERE status='queued' OR (status='research_paused' AND datetime(last_updated)<=datetime('now','-60 minutes')) OR (status='running' AND datetime(last_updated)<=datetime('now','-30 minutes')) ORDER BY priority DESC,created_at ASC LIMIT 1`).first();
   if(!next) return {ok:true,processed:false};
   return await processOperationalObjective(env,next.id);
 }
