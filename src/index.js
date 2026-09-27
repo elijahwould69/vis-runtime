@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.1-operational",
+  version: "1.8.2-adaptive-research",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -766,10 +766,43 @@ async function ensureSchema(env) {
       department_synthesis_id TEXT, challenge_id TEXT, reintegrated_knowledge_id TEXT,
       package TEXT NOT NULL, status TEXT DEFAULT 'ready', founder_action_required INTEGER DEFAULT 0,
       authority_scope TEXT DEFAULT 'internal-zero-dollar', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS ventures (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, venture_type TEXT DEFAULT 'company', status TEXT DEFAULT 'active',
+      context TEXT, authority_scope TEXT DEFAULT 'internal-zero-dollar', created_at TEXT DEFAULT CURRENT_TIMESTAMP, last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS mission_research_plans (
+      id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, research_goal TEXT NOT NULL,
+      plan_json TEXT NOT NULL, status TEXT DEFAULT 'active', created_at TEXT DEFAULT CURRENT_TIMESTAMP, last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS mission_research_questions (
+      id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, objective_id TEXT NOT NULL, venture_id TEXT NOT NULL,
+      question TEXT NOT NULL, source_classes TEXT, priority INTEGER DEFAULT 3, status TEXT DEFAULT 'open',
+      answer_summary TEXT, evidence_refs TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS research_source_registry (
+      id TEXT PRIMARY KEY, source_class TEXT NOT NULL, name TEXT NOT NULL, base_url TEXT,
+      scope TEXT, reliability_note TEXT, status TEXT DEFAULT 'active', created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`
   ];
 
   for (const sql of v18Statements) await env.DB.prepare(sql).run();
+
+  for (const sql of [
+    `ALTER TABLE operational_objectives ADD COLUMN venture_id TEXT DEFAULT 'PORTFOLIO'`,
+    `ALTER TABLE founder_decision_packages ADD COLUMN venture_id TEXT DEFAULT 'PORTFOLIO'`
+  ]) { try { await env.DB.prepare(sql).run(); } catch (_) {} }
+
+  await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
+    ('SRC-STATCAN','official-statistics','Statistics Canada','https://www.statcan.gc.ca/','Canadian economic, industry, labour, trade and business statistics','Primary government statistical source'),
+    ('SRC-CANADABUYS','procurement','CanadaBuys','https://canadabuys.canada.ca/','Federal procurement opportunities and contracting information','Primary Government of Canada procurement source'),
+    ('SRC-BCBID','procurement','BC Bid','https://www.bcbid.gov.bc.ca/','British Columbia public-sector procurement','Primary BC procurement source'),
+    ('SRC-BCSTATS','official-statistics','BC Stats','https://www2.gov.bc.ca/gov/content/data/statistics','British Columbia economic and demographic statistics','Primary provincial statistical source'),
+    ('SRC-MUNICIPAL','municipal-procurement','Municipal procurement sources',NULL,'Municipal tenders, capital plans and facility procurement relevant to the venture geography','Use official municipal sources when configured'),
+    ('SRC-TRADE','trade-market','Canadian trade data',NULL,'Import, export, product and distribution market evidence','Prefer official trade/statistical sources'),
+    ('SRC-INDUSTRY','industry-market','Industry and commercial sources',NULL,'Industry demand, competitors, pricing, facilities and buyer evidence','Require provenance and separate commercial claims from verified facts'),
+    ('SRC-TECH','technology-signal','Technology signal sources',NULL,'Emerging technology and automation signals','Contextual signal only unless directly relevant to mission')`).run();
 
   const v18Indexes = [
     `CREATE INDEX IF NOT EXISTS idx_hive_knowledge_subject ON hive_knowledge(subject)`,
@@ -4446,6 +4479,53 @@ async function runOperationalAcceptanceTest(env) {
 }
 
 
+const RESEARCH_DIRECTOR_SYSTEM = `
+You are the VIS Research Director. The Hive has received a specific venture mission.
+Design the minimum high-value research program needed to answer that mission. Do not force the mission toward the evidence already available.
+Treat the venture as isolated: use its own context, economics, risks and objectives. Shared Hive knowledge may inform questions but is not automatically evidence for this venture.
+Return ONLY JSON with keys: research_goal, questions. questions must be an array of 4-8 objects with question, source_classes, priority, why_it_matters.
+Allowed source_classes: official-statistics, procurement, municipal-procurement, trade-market, industry-market, technology-signal, regulatory, customer-demand, competitor-pricing, labour, supply-chain.
+Prioritize direct evidence capable of changing a business decision. Unfamiliar industries trigger research, not rejection.
+`;
+
+async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) {
+  const venture=await env.DB.prepare(`SELECT * FROM ventures WHERE id=?`).bind(ventureId).first();
+  const prompt=`VENTURE: ${venture?.name||ventureId}\nVENTURE CONTEXT: ${venture?.context||'No additional context.'}\nMISSION: ${objective}\nDesign mission-directed eyes-and-ears research before opportunity synthesis.`;
+  let parsed=null;
+  try {
+    const raw=await think(env,RESEARCH_DIRECTOR_SYSTEM,prompt,1200,.25);
+    const m=String(raw||'').match(/\{[\s\S]*\}/);
+    if(m) parsed=JSON.parse(m[0]);
+  } catch(_) {}
+  if(!parsed || !Array.isArray(parsed.questions) || parsed.questions.length<4) parsed={research_goal:`Resolve the highest-value evidence gaps for ${objectiveId} without contaminating the mission with unrelated portfolio signals.`,questions:[
+    {question:'What verified customer or buyer pain directly matches this mission?',source_classes:['customer-demand','industry-market'],priority:5,why_it_matters:'Demand must be demonstrated.'},
+    {question:'What current procurement, contract, or purchasing evidence exists for this mission?',source_classes:['procurement','municipal-procurement'],priority:5,why_it_matters:'Direct buyer evidence is stronger than generic trends.'},
+    {question:'What do official statistics show about market size, growth, labour, and geography?',source_classes:['official-statistics','labour'],priority:4,why_it_matters:'Establishes market context.'},
+    {question:'What competitors, substitutes, pricing, and delivery models exist?',source_classes:['competitor-pricing','industry-market'],priority:4,why_it_matters:'Tests economics and differentiation.'},
+    {question:'What operational, regulatory, supply-chain, or capability constraints could kill the venture?',source_classes:['regulatory','supply-chain'],priority:4,why_it_matters:'Prevents attractive but infeasible conclusions.'}
+  ]};
+  const id=`MRP-${crypto.randomUUID()}`;
+  await env.DB.prepare(`INSERT INTO mission_research_plans (id,objective_id,venture_id,research_goal,plan_json,status,last_updated) VALUES (?,?,?,?,?,'active',?)`).bind(id,objectiveId,ventureId,cleanText(parsed.research_goal,2000),JSON.stringify(parsed),nowISO()).run();
+  for(const q of parsed.questions.slice(0,8)) await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,?,'open',?)`).bind(`MRQ-${crypto.randomUUID()}`,id,objectiveId,ventureId,cleanText(q.question,1200),JSON.stringify(q.source_classes||[]),Math.max(1,Math.min(5,Number(q.priority||3))),nowISO()).run();
+  return {id,plan:parsed};
+}
+
+const EVIDENCE_CURATOR_SYSTEM=`
+You are the VIS Evidence Curator. Select evidence for a venture mission, not for general interest.
+Reject topical but mission-irrelevant material. A technology article is not business evidence merely because it is recent.
+Return ONLY JSON: {selected_indexes:[integers], rejected_reason_summary:string}. Select only items that directly help answer the research plan or mission. It is acceptable to select none.
+`;
+
+async function curateMissionEvidence(env,{objective,ventureId,researchPlan,candidates}) {
+  if(!candidates.length) return [];
+  try {
+    const raw=await think(env,EVIDENCE_CURATOR_SYSTEM,`VENTURE: ${ventureId}\nMISSION: ${objective}\nRESEARCH PLAN: ${JSON.stringify(researchPlan)}\nCANDIDATES: ${JSON.stringify(candidates.map((x,i)=>({index:i,...x})))}`,1200,.1);
+    const m=String(raw||'').match(/\{[\s\S]*\}/); if(!m) return [];
+    const p=JSON.parse(m[0]); const idx=new Set((p.selected_indexes||[]).filter(Number.isInteger));
+    return candidates.filter((_,i)=>idx.has(i));
+  } catch(_) { return []; }
+}
+
 const OPERATIONAL_WORKER_SYSTEM = `
 You are a constrained VIS operational worker performing real internal company analysis.
 Use ONLY the inherited Hive knowledge packet and the stated objective. Do not invent current facts, customers, contracts, prices, projects, or evidence.
@@ -4481,8 +4561,8 @@ async function createFounderDecisionPackage(env, record) {
   const packageText=`FOUNDER DECISION PACKAGE\nOBJECTIVE: ${record.objective}\n\nDISCOVERY SYNTHESIS:\n${record.departmentSynthesis}\n\nINDEPENDENT VECTOR CHALLENGE:\n${record.challengeReview}\n\nVECTOR DECISION: ${record.challengeDecision}\n\nAUTHORITY: internal-zero-dollar. No external action has been taken. Any spend, prospect contact, bid/submission, public publishing, consequential account creation, contract, payment, legal/compliance representation, or other consequential external action requires Founder approval.`;
   const founderActionRequired=record.challengeDecision==='HOLD'?1:0;
   await env.DB.prepare(`INSERT INTO founder_decision_packages
-    (id,objective_id,work_order_id,department_synthesis_id,challenge_id,reintegrated_knowledge_id,package,status,founder_action_required,authority_scope)
-    VALUES (?,?,?,?,?,?,?,'ready',?,?)`).bind(id,record.objectiveId,record.workOrderId,record.departmentSynthesisId,record.challengeId,record.knowledgeId,cleanText(packageText,20000),founderActionRequired,record.authorityScope||'internal-zero-dollar').run();
+    (id,objective_id,work_order_id,department_synthesis_id,challenge_id,reintegrated_knowledge_id,package,status,founder_action_required,authority_scope,venture_id)
+    VALUES (?,?,?,?,?,?,?,'ready',?,?,?)`).bind(id,record.objectiveId,record.workOrderId,record.departmentSynthesisId,record.challengeId,record.knowledgeId,cleanText(packageText,20000),founderActionRequired,record.authorityScope||'internal-zero-dollar',record.ventureId||'PORTFOLIO').run();
   return {id,package:packageText,founderActionRequired};
 }
 
@@ -4493,7 +4573,8 @@ async function processOperationalObjective(env, objectiveId) {
   assertInternalAuthority(row.authority_scope);
   if(row.status==='completed') return {ok:true,alreadyCompleted:true,objectiveId:row.id,workOrderId:row.work_order_id,decisionPackageId:row.decision_package_id};
   if(row.status==='running') return {ok:true,alreadyRunning:true,objectiveId:row.id,workOrderId:row.work_order_id};
-  const wo=row.work_order_id||`DCC-WO-${crypto.randomUUID()}`;
+  const ventureId=cleanText(row.venture_id,120)||'PORTFOLIO';
+  const wo=row.work_order_id||`${ventureId}-WO-${crypto.randomUUID()}`;
   try {
     await env.DB.prepare(`UPDATE operational_objectives SET status='running',work_order_id=?,started_at=COALESCE(started_at,?),last_updated=? WHERE id=?`).bind(wo,nowISO(),nowISO(),row.id).run();
     const existingWO=await env.DB.prepare(`SELECT id FROM work_orders WHERE id=?`).bind(wo).first();
@@ -4501,9 +4582,10 @@ async function processOperationalObjective(env, objectiveId) {
     await env.DB.prepare(`UPDATE work_orders SET status='running',started_at=COALESCE(started_at,?),last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),wo).run();
     const seedObjective=await createHiveKnowledge(env,{knowledgeType:'founder-objective',subject:`Operational objective ${row.id}`,content:row.objective,confidence:1,verificationStatus:'founder-supplied',sourceType:'founder-intake',sourceRef:row.id});
     const seedPolicy=await createHiveKnowledge(env,{knowledgeType:'operating-policy',subject:'DCC operational authority boundary',content:'VIS may perform internal zero-dollar research, analysis, synthesis, worker coordination, recovery, and documentation. It may not contact prospects, submit bids, spend money, publish publicly, create consequential accounts, enter agreements, make payments, or make legal/compliance representations without explicit Founder approval. Unknown current facts must remain unknown until supported by evidence.',confidence:1,verificationStatus:'operating-policy',sourceType:'hive-policy',sourceRef:'V1.8.1'});
-    const recentEvidence=await env.DB.prepare(`SELECT source_name,item_url,title,evidence_text,verification_status,retrieved_at FROM evidence ORDER BY id DESC LIMIT 20`).all();
-    const recentResearch=await env.DB.prepare(`SELECT agent_id,finding,evidence,implication,recommended_action,created_at FROM research ORDER BY rowid DESC LIMIT 12`).all();
-    const seedResearch=await createHiveKnowledge(env,{knowledgeType:'current-internal-evidence',subject:`Recent VIS evidence for ${row.id}`,content:JSON.stringify({evidence:recentEvidence.results||[],research:recentResearch.results||[]}),confidence:.7,verificationStatus:'retrieved-and-internal-analysis',sourceType:'vis-runtime',sourceRef:row.id});
+    const researchPlan=await createMissionResearchPlan(env,{objectiveId:row.id,ventureId,objective:row.objective});
+    const recentEvidence=await env.DB.prepare(`SELECT source_name,item_url,title,evidence_text,verification_status,retrieved_at FROM evidence ORDER BY id DESC LIMIT 40`).all();
+    const curatedEvidence=await curateMissionEvidence(env,{objective:row.objective,ventureId,researchPlan:researchPlan.plan,candidates:recentEvidence.results||[]});
+    const seedResearch=await createHiveKnowledge(env,{knowledgeType:'mission-directed-evidence',subject:`Curated evidence for ${ventureId} / ${row.id}`,content:JSON.stringify({ventureId,researchPlanId:researchPlan.id,researchPlan:researchPlan.plan,curatedEvidence,evidenceGap:curatedEvidence.length===0?'No current sensor evidence passed mission relevance gating. Research questions remain open; do not substitute unrelated signals.':null}),confidence:curatedEvidence.length?.75:.4,verificationStatus:'mission-curated',sourceType:'adaptive-research',sourceRef:researchPlan.id});
     const seeds=[seedObjective,seedPolicy,seedResearch];
     const planning=await aiPrimaryManagerPlan(env,{workOrderId:wo,objective:row.objective,knowledgeIds:seeds,authorityScope:row.authority_scope});
     const assignments=[];
@@ -4528,7 +4610,7 @@ async function processOperationalObjective(env, objectiveId) {
     await env.DB.prepare(`INSERT INTO department_syntheses (id,work_order_id,department_id,head_agent,synthesis,evidence_refs,worker_result_refs,status) VALUES (?,?,?,?,?,?,?,'submitted')`).bind(dsId,wo,'DISCOVERY',head?.agent_id||'ATLAS',cleanText(departmentText,12000),JSON.stringify(seeds),JSON.stringify(managerSyntheses.flatMap(x=>x.workerRefs))).run();
     const challenge=await createCrossDepartmentReview(env,{workOrderId:wo,reviewerDepartmentId:'DILIGENCE',subjectSynthesisId:dsId,objective:row.objective});
     const knowledgeId=await reintegrateHiveKnowledge(env,{workOrderId:wo,synthesisId:dsId,reviewRefs:[challenge.id],knowledgeType:'operational-learning',subject:`Operational learning ${row.id}`,content:`DISCOVERY synthesis: ${departmentText}\nIndependent DILIGENCE review: ${challenge.review}`,confidence:.75,verificationStatus:'vector-reviewed',disposition:challenge.decision==='REJECT'?'held':'accepted',rationale:'Real operational work completed under internal-zero-dollar authority with independent challenge.'});
-    const pkg=await createFounderDecisionPackage(env,{objectiveId:row.id,workOrderId:wo,objective:row.objective,departmentSynthesisId:dsId,departmentSynthesis:departmentText,challengeId:challenge.id,challengeReview:challenge.review,challengeDecision:challenge.decision,knowledgeId,authorityScope:row.authority_scope});
+    const pkg=await createFounderDecisionPackage(env,{objectiveId:row.id,workOrderId:wo,objective:row.objective,departmentSynthesisId:dsId,departmentSynthesis:departmentText,challengeId:challenge.id,challengeReview:challenge.review,challengeDecision:challenge.decision,knowledgeId,authorityScope:row.authority_scope,ventureId});
     await env.DB.prepare(`UPDATE work_orders SET status='completed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),wo).run();
     await env.DB.prepare(`UPDATE operational_objectives SET status='completed',decision_package_id=?,completed_at=?,last_updated=? WHERE id=?`).bind(pkg.id,nowISO(),nowISO(),row.id).run();
     await audit(env,'HIVE_OPERATIONAL_INTAKE','OBJECTIVE_COMPLETED',wo,JSON.stringify({objectiveId:row.id,planningMode:planning.planningMode,departmentMode,managerCount:assignments.length,workerCount:workers.length,challengeDecision:challenge.decision,decisionPackageId:pkg.id,externalSpendUSD:0}));
@@ -4554,7 +4636,11 @@ async function intakeOperationalObjective(env, request) {
   const prior=await env.DB.prepare(`SELECT * FROM operational_objectives WHERE idempotency_key=?`).bind(key).first();
   if(prior) return {ok:true,idempotentReplay:true,objectiveId:prior.id,workOrderId:prior.work_order_id,status:prior.status,decisionPackageId:prior.decision_package_id,externalSpendUSD:0};
   const id=cleanText(body?.objectiveId,120)||`OBJ-${crypto.randomUUID()}`;
-  await env.DB.prepare(`INSERT INTO operational_objectives (id,idempotency_key,objective,requested_by,authority_scope,priority,status,last_updated) VALUES (?,?,?,?,?,?,'queued',?)`).bind(id,key,objective,cleanText(body?.requestedBy,200)||'FOUNDER','internal-zero-dollar',Math.max(1,Math.min(5,Number(body?.priority||1))),nowISO()).run();
+  const ventureId=cleanText(body?.ventureId,120)||'PORTFOLIO';
+  let venture=await env.DB.prepare(`SELECT id FROM ventures WHERE id=?`).bind(ventureId).first();
+  if(!venture && ventureId!=='PORTFOLIO') throw new Error('Unknown ventureId. Register the venture before assigning work so portfolio contexts remain isolated.');
+  if(!venture && ventureId==='PORTFOLIO') { await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('PORTFOLIO','VIS Venture Portfolio','portfolio','active','Shared portfolio research and venture creation. Venture-specific conclusions must remain isolated until deliberately reintegrated.','internal-zero-dollar',?)`).bind(nowISO()).run(); }
+  await env.DB.prepare(`INSERT INTO operational_objectives (id,idempotency_key,work_order_id,objective,requested_by,authority_scope,priority,status,last_updated,venture_id) VALUES (?,?,NULL,?,?,?,?, 'queued',?,?)`).bind(id,key,objective,cleanText(body?.requestedBy,200)||'FOUNDER','internal-zero-dollar',Math.max(1,Math.min(5,Number(body?.priority||1))),nowISO(),ventureId).run();
   await audit(env,'HIVE_OPERATIONAL_INTAKE','OBJECTIVE_ACCEPTED',id,JSON.stringify({idempotencyKey:key,authorityScope:authority,externalSpendUSD:0}));
   if(body?.executeNow===false) return {ok:true,objectiveId:id,status:'queued',externalSpendUSD:0};
   return await processOperationalObjective(env,id);
@@ -4761,6 +4847,19 @@ export default {
           });
         }
 
+
+        if (url.pathname === "/admin/ventures" && request.method === "GET") {
+          await ensureSchema(env);
+          return json({ok:true,ventures:(await env.DB.prepare(`SELECT * FROM ventures ORDER BY created_at`).all()).results||[]});
+        }
+
+        if (url.pathname.startsWith("/admin/research-plan/") && request.method === "GET") {
+          await ensureSchema(env);
+          const oid=decodeURIComponent(url.pathname.slice("/admin/research-plan/".length));
+          const plan=await env.DB.prepare(`SELECT * FROM mission_research_plans WHERE objective_id=? ORDER BY created_at DESC LIMIT 1`).bind(oid).first();
+          const questions=plan?(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? ORDER BY priority DESC,created_at`).bind(plan.id).all()).results||[]:[];
+          return json({ok:Boolean(plan),plan,questions});
+        }
 
         if (
           url.pathname === "/admin/objectives" &&
