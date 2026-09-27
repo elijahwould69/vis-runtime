@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.11-timestamp-safe-objective-recovery",
+  version: "1.8.12-objective-lifecycle-queue-hygiene",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -872,6 +872,10 @@ async function ensureSchema(env) {
 
   for (const sql of [
     `ALTER TABLE operational_objectives ADD COLUMN venture_id TEXT DEFAULT 'PORTFOLIO'`,
+    `ALTER TABLE operational_objectives ADD COLUMN lifecycle_state TEXT DEFAULT 'active'`,
+    `ALTER TABLE operational_objectives ADD COLUMN continuation_count INTEGER DEFAULT 0`,
+    `ALTER TABLE operational_objectives ADD COLUMN continuation_limit INTEGER DEFAULT 8`,
+    `ALTER TABLE operational_objectives ADD COLUMN retired_reason TEXT`,
     `ALTER TABLE founder_decision_packages ADD COLUMN venture_id TEXT DEFAULT 'PORTFOLIO'`,
     `ALTER TABLE mission_research_branches ADD COLUMN depth INTEGER DEFAULT 1`,
     `ALTER TABLE mission_research_branches ADD COLUMN fingerprint TEXT`,
@@ -906,6 +910,7 @@ async function ensureSchema(env) {
     `CREATE INDEX IF NOT EXISTS idx_it_incidents_status ON it_incidents(status)`,
     `CREATE INDEX IF NOT EXISTS idx_planning_telemetry_work ON planning_telemetry(work_order_id)`,
     `CREATE INDEX IF NOT EXISTS idx_operational_objectives_status ON operational_objectives(status,priority,created_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_operational_objectives_lifecycle_queue ON operational_objectives(lifecycle_state,status,priority,created_at)`,
     `CREATE INDEX IF NOT EXISTS idx_founder_packages_work ON founder_decision_packages(work_order_id)`
   ];
   for (const sql of v18Indexes) await env.DB.prepare(sql).run();
@@ -927,6 +932,20 @@ async function ensureSchema(env) {
       ('RR-MANAGER-RESUME','MANAGER_INTERRUPTION','manager','resume-from-persisted-worker-results',1,1,'active',?),
       ('RR-AI-FALLBACK','AI_INFERENCE_EMPTY','ai','bounded-retry-then-deterministic-fallback',3,1,'active',?)
   `).bind(nowISO(),nowISO(),nowISO()).run();
+
+  // V1.8.12: consumed acceptance objectives stay queryable but cannot consume
+  // production queue compute.
+  await env.DB.prepare(`
+    UPDATE operational_objectives
+    SET lifecycle_state='archived',
+        retired_reason=COALESCE(retired_reason,'consumed-acceptance-objective')
+    WHERE id IN (
+      'ARE-002','ARE-003','DCC-001','DCC-002','DCC-003',
+      'EYES-001','GOV-METER-002','HAT-001','HRT-001',
+      'EAT-001','SAT-001','OAT-001'
+    )
+      AND COALESCE(lifecycle_state,'active') <> 'archived'
+  `).run().catch(()=>{});
 }
 
 /* ============================================================
@@ -2553,6 +2572,8 @@ async function recoverStaleRuntimeState(env) {
       (${objectiveTimeExpr} <= ${staleCutoffExpr}) AS is_stale
     FROM operational_objectives
     WHERE status = 'running'
+      AND COALESCE(lifecycle_state,'active')='active'
+      AND COALESCE(continuation_count,0) < COALESCE(continuation_limit,8)
     ORDER BY ${objectiveTimeExpr} ASC, priority DESC, created_at ASC
     LIMIT 1
   `).first();
@@ -2594,6 +2615,8 @@ async function recoverStaleRuntimeState(env) {
           last_updated = ?
       WHERE id = ?
         AND status = 'running'
+        AND COALESCE(lifecycle_state,'active')='active'
+        AND COALESCE(continuation_count,0) < COALESCE(continuation_limit,8)
         AND julianday(replace(substr(COALESCE(last_updated, started_at, created_at),1,19),'T',' '))
             <= julianday('now') - (30.0 / 1440.0)
     `).bind(nowISO(), staleObjective.id).run();
@@ -5257,17 +5280,63 @@ async function intakeOperationalObjective(env, request) {
 async function continueOperationalQueue(env) {
   await ensureSchema(env);
   const next=await env.DB.prepare(`
-    SELECT id
+    SELECT id,status,continuation_count,continuation_limit
     FROM operational_objectives
-    WHERE status='queued'
-       OR (status='research_required' AND datetime(last_updated)<=datetime('now','-60 minutes'))
-       OR (status='research_paused' AND datetime(last_updated)<=datetime('now','-60 minutes'))
-       OR (status='running' AND julianday(replace(substr(COALESCE(last_updated,started_at,created_at),1,19),'T',' '))<=julianday('now')-(30.0/1440.0))
-    ORDER BY priority DESC,created_at ASC
+    WHERE COALESCE(lifecycle_state,'active')='active'
+      AND COALESCE(continuation_count,0) < COALESCE(continuation_limit,8)
+      AND (
+        status='queued'
+        OR (status='research_required' AND datetime(last_updated)<=datetime('now','-60 minutes'))
+        OR (status='research_paused' AND datetime(last_updated)<=datetime('now','-60 minutes'))
+        OR (status='running' AND julianday(replace(substr(COALESCE(last_updated,started_at,created_at),1,19),'T',' '))<=julianday('now')-(30.0/1440.0))
+      )
+    ORDER BY priority DESC,
+      CASE status WHEN 'queued' THEN 0 WHEN 'running' THEN 1 ELSE 2 END,
+      datetime(replace(substr(COALESCE(last_updated,created_at),1,19),'T',' ')) ASC,
+      created_at ASC
     LIMIT 1
   `).first();
   if(!next) return {ok:true,processed:false};
-  return await processOperationalObjective(env,next.id);
+
+  const claimed=await env.DB.prepare(`
+    UPDATE operational_objectives
+    SET continuation_count=COALESCE(continuation_count,0)+1
+    WHERE id=?
+      AND COALESCE(lifecycle_state,'active')='active'
+      AND COALESCE(continuation_count,0) < COALESCE(continuation_limit,8)
+  `).bind(next.id).run();
+  if((claimed.meta?.changes||0)!==1) return {ok:true,processed:false,reason:'queue-claim-lost'};
+
+  const result=await processOperationalObjective(env,next.id);
+  const post=await env.DB.prepare(`
+    SELECT id,status,lifecycle_state,continuation_count,continuation_limit
+    FROM operational_objectives WHERE id=?
+  `).bind(next.id).first();
+
+  if(post && post.status==='research_required' &&
+     Number(post.continuation_count||0)>=Number(post.continuation_limit||8)) {
+    await env.DB.prepare(`
+      UPDATE operational_objectives
+      SET lifecycle_state='held',
+          retired_reason='continuation-limit-reached',
+          last_updated=?
+      WHERE id=? AND lifecycle_state='active'
+    `).bind(nowISO(),next.id).run();
+    await audit(env,'JANITOR','OBJECTIVE_CONTINUATION_LIMIT_HELD',next.id,JSON.stringify({
+      objectiveId:next.id,
+      continuationCount:Number(post.continuation_count||0),
+      continuationLimit:Number(post.continuation_limit||8),
+      action:'held-for-review-no-further-autonomous-compute',
+      externalSpendUSD:0
+    }));
+  }
+
+  return {...result,queueLifecycle:{
+    objectiveId:next.id,
+    continuationCount:Number(post?.continuation_count||0),
+    continuationLimit:Number(post?.continuation_limit||8),
+    lifecycleState:post?.lifecycle_state||'active'
+  }};
 }
 
 async function getOperationalObjective(env,id) {
