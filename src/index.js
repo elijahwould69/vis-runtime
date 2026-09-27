@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.13-evidence-convergence-engine",
+  version: "1.8.14-research-plan-rebase",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -4990,6 +4990,85 @@ async function persistResearchEvidence(env,{runId,planId,qrow,doc,text,relevance
 
 async function branchFingerprint(q){ return await researchFingerprint(String(q||'').toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim()); }
 
+
+async function ensureConvergedResearchPlan(env,{objectiveId,ventureId,objective,existingPlan}){
+  if(!existingPlan) return await createMissionResearchPlan(env,{objectiveId,ventureId,objective});
+
+  let planJson={};
+  try{ planJson=JSON.parse(existingPlan.plan_json||'{}'); }catch(_){}
+  if(planJson?.convergence_version==='1.8.14') return {id:existingPlan.id,plan:planJson,rebase:false};
+
+  const rows=(await env.DB.prepare(`
+    SELECT id,question,status,priority,evidence_refs
+    FROM mission_research_questions
+    WHERE plan_id=?
+    ORDER BY COALESCE(priority,3) DESC,created_at
+  `).bind(existingPlan.id).all()).results||[];
+
+  const unresolved=rows.filter(r=>['open','research_required'].includes(r.status));
+  const lowValue=unresolved.filter(r=>commercialInformationGain(r.question,'')<4);
+  const genericRatio=unresolved.length?lowValue.length/unresolved.length:0;
+
+  // V1.8.14 performs a one-time rebase for legacy plans. Evidence is never
+  // deleted: old questions/plans are preserved and merely superseded.
+  if(genericRatio<0.25 && unresolved.length<=10){
+    planJson.convergence_version='1.8.14';
+    await env.DB.prepare(`UPDATE mission_research_plans SET plan_json=?,last_updated=? WHERE id=?`)
+      .bind(JSON.stringify(planJson),nowISO(),existingPlan.id).run();
+    return {id:existingPlan.id,plan:planJson,rebase:false};
+  }
+
+  await env.DB.prepare(`
+    UPDATE mission_research_questions
+    SET status='superseded',last_updated=?
+    WHERE plan_id=? AND status IN ('open','research_required')
+  `).bind(nowISO(),existingPlan.id).run();
+
+  await env.DB.prepare(`UPDATE mission_research_plans SET status='superseded',last_updated=? WHERE id=?`)
+    .bind(nowISO(),existingPlan.id).run();
+
+  const newPlanId=`MRP-${crypto.randomUUID()}`;
+  const questions=[
+    {question:`Which specific British Columbia buyer organization or narrowly defined buyer class has a current budget and purchasing mechanism for the opportunity sought by ${objectiveId}?`,source_classes:['procurement','municipal-procurement','customer-demand'],priority:5,why_it_matters:'Identifies the economic buyer.'},
+    {question:`What current primary evidence shows a costly, urgent, recurring problem for that specific buyer, including measurable delay, shortage, failure, compliance burden, or operating cost?`,source_classes:['customer-demand','procurement','official-statistics'],priority:5,why_it_matters:'Proves buyer pain.'},
+    {question:`What concrete product or service could VIS-backed operators deliver to solve that evidenced buyer problem, and what purchased scopes or specifications define the offer?`,source_classes:['procurement','competitor-pricing','industry-market'],priority:5,why_it_matters:'Defines a sellable offer.'},
+    {question:`Which current tenders, awards, purchase records, budgets, or recurring transactions demonstrate demand for that buyer-problem-offer combination in British Columbia?`,source_classes:['procurement','municipal-procurement','customer-demand'],priority:5,why_it_matters:'Demonstrates purchasing demand.'},
+    {question:`What current contract values, posted prices, direct labour/material inputs, or comparable transactions support revenue, direct-cost, and gross-margin estimates for one sale?`,source_classes:['competitor-pricing','procurement','official-statistics'],priority:5,why_it_matters:'Tests unit economics.'},
+    {question:`Which named competitors or substitutes currently serve this buyer, what do they offer, and where is a defensible service, speed, cost, specialization, or distribution gap?`,source_classes:['competitor-pricing','industry-market'],priority:4,why_it_matters:'Tests differentiation.'},
+    {question:`What equipment, labour, supplier, certification, insurance, regulatory, and delivery requirements are necessary to fulfill the offer, and which could prevent entry?`,source_classes:['regulatory','labour','supply-chain'],priority:4,why_it_matters:'Tests operational feasibility and risk.'},
+    {question:`How does the specific buyer discover, qualify, approve, and purchase from suppliers, and what realistic first route-to-market can reach that buyer without consequential external action?`,source_classes:['procurement','municipal-procurement','customer-demand'],priority:5,why_it_matters:'Defines route-to-market and learnability.'}
+  ];
+  const plan={
+    convergence_version:'1.8.14',
+    rebased_from:existingPlan.id,
+    research_goal:`Converge ${objectiveId} on one evidence-backed buyer → pain → offer → demand → economics → competition → operations/risk → route-to-market opportunity while preserving all historical evidence.`,
+    questions
+  };
+  await env.DB.prepare(`
+    INSERT INTO mission_research_plans
+      (id,objective_id,venture_id,research_goal,plan_json,status,last_updated)
+    VALUES (?,?,?,?,?,'active',?)
+  `).bind(newPlanId,objectiveId,ventureId,plan.research_goal,JSON.stringify(plan),nowISO()).run();
+
+  for(const q of questions){
+    await env.DB.prepare(`
+      INSERT INTO mission_research_questions
+        (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated)
+      VALUES (?,?,?,?,?,?,?,'open',?)
+    `).bind(`MRQ-${crypto.randomUUID()}`,newPlanId,objectiveId,ventureId,q.question,JSON.stringify(q.source_classes),q.priority,nowISO()).run();
+  }
+
+  await audit(env,'ADAPTIVE_RESEARCH','RESEARCH_PLAN_REBASED',objectiveId,JSON.stringify({
+    objectiveId,ventureId,oldPlanId:existingPlan.id,newPlanId,
+    unresolvedLegacyQuestions:unresolved.length,
+    supersededLowValueQuestions:lowValue.length,
+    preservedHistoricalEvidence:true,
+    convergenceVersion:'1.8.14',
+    externalSpendUSD:0
+  }));
+  return {id:newPlanId,plan,rebase:true,oldPlanId:existingPlan.id};
+}
+
 async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuestions=8,maxDepth=2,maxTotalQuestions=16,maxSourceFetches=20}){
   const runId=`MRUN-${crypto.randomUUID()}`, attentionId=`RAL-${crypto.randomUUID()}`;
   await env.DB.prepare(`INSERT INTO mission_research_runs (id,plan_id,objective_id,venture_id,status) VALUES (?,?,?,?, 'running')`).bind(runId,planId,objectiveId,ventureId).run();
@@ -5249,7 +5328,7 @@ async function processOperationalObjective(env, objectiveId) {
     const seedObjective=await createHiveKnowledge(env,{knowledgeType:'founder-objective',subject:`Operational objective ${row.id}`,content:row.objective,confidence:1,verificationStatus:'founder-supplied',sourceType:'founder-intake',sourceRef:row.id});
     const seedPolicy=await createHiveKnowledge(env,{knowledgeType:'operating-policy',subject:'DCC operational authority boundary',content:'VIS may perform internal zero-dollar research, analysis, synthesis, worker coordination, recovery, and documentation. It may not contact prospects, submit bids, spend money, publish publicly, create consequential accounts, enter agreements, make payments, or make legal/compliance representations without explicit Founder approval. Unknown current facts must remain unknown until supported by evidence.',confidence:1,verificationStatus:'operating-policy',sourceType:'hive-policy',sourceRef:'V1.8.1'});
     const existingResearchPlan=await env.DB.prepare(`SELECT * FROM mission_research_plans WHERE objective_id=? ORDER BY created_at DESC LIMIT 1`).bind(row.id).first();
-    const researchPlan=existingResearchPlan?{id:existingResearchPlan.id,plan:(()=>{try{return JSON.parse(existingResearchPlan.plan||'{}')}catch{return {}}})()}:await createMissionResearchPlan(env,{objectiveId:row.id,ventureId,objective:row.objective});
+    const researchPlan=await ensureConvergedResearchPlan(env,{objectiveId:row.id,ventureId,objective:row.objective,existingPlan:existingResearchPlan});
     const researchRun=await executeMissionResearch(env,{planId:researchPlan.id,objectiveId:row.id,ventureId,maxQuestions:8,maxDepth:2,maxTotalQuestions:16,maxSourceFetches:20});
     if(researchRun.providerState){
       await env.DB.prepare(`UPDATE operational_objectives SET status='research_paused',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
