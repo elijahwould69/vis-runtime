@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.26-constraint-aware-candidate-search",
+  version: "1.8.27-mission-completion-propagation",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -908,6 +908,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.24-001','1.8.24','Canonical Procurement Record Filter: utility and navigation pages are rejected; fetched candidates must contain transaction-shaped content before entering evidence extraction; identity lock remains fail-closed')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.25-001','1.8.25','Mission Constraint Gate: transaction identity and mission fit are evaluated separately; geography and recency are optional user-selectable constraints rather than global defaults; mismatched records remain valid Hive evidence but cannot satisfy the mission')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.26-001','1.8.26','Constraint-Aware Candidate Search: canonical procurement candidates are evaluated independently; locked mismatches remain valid Hive evidence while the bounded research run continues through later candidates until a mission match is found or the candidate budget is exhausted')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.27-001','1.8.27','Mission Completion Propagation: a qualified mission-matched transaction propagates terminal success to the parent research plan and operational objective; residual unanswered research is retained as non-blocking Hive learning')`).run();
 
   await env.DB.prepare(`INSERT OR IGNORE INTO ventures (id,name,venture_type,status,context,authority_scope,last_updated) VALUES ('DCC','Douglas Contracting Company Inc.','company','active','DCC is one portfolio company. Treat its objectives, evidence, economics, history and decisions as venture-isolated while allowing validated learning to return to the shared Hive.','internal-zero-dollar',?)`).bind(nowISO()).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO research_source_registry (id,source_class,name,base_url,scope,reliability_note) VALUES
@@ -5498,6 +5499,49 @@ async function latestQualifiedTransaction(env,planId){
   return await env.DB.prepare(`SELECT * FROM transaction_evidence_extractions WHERE plan_id=? AND extraction_status='qualified' AND identity_status='locked' AND canonical_source_url IS NOT NULL AND transaction_fingerprint IS NOT NULL ORDER BY created_at DESC LIMIT 1`).bind(planId).first();
 }
 
+async function propagateMissionCompletion(env,{planId,objectiveId,workOrderId,ventureId,researchRun}){
+  const tx=await latestQualifiedTransaction(env,planId);
+  if(!tx || tx.mission_fit_status!=='matched') return {completed:false,transaction:null};
+
+  const completionKnowledgeId=await createHiveKnowledge(env,{
+    knowledgeType:'mission-completion',
+    subject:`Mission completion ${objectiveId}`,
+    content:JSON.stringify({
+      objectiveId,ventureId,planId,researchRunId:researchRun?.runId||null,
+      terminalCondition:'qualified canonical transaction with locked identity and matched mission fit',
+      transactionExtractionId:tx.id,buyer:tx.buyer_name,scope:tx.purchased_scope,
+      procurementIdentifier:tx.procurement_identifier,procurementMechanism:tx.procurement_mechanism,
+      canonicalSourceUrl:tx.canonical_source_url,transactionFingerprint:tx.transaction_fingerprint,
+      identityStatus:tx.identity_status,missionFitStatus:tx.mission_fit_status,
+      missionConstraints:tx.mission_constraints_json,missionMismatches:tx.mission_mismatches_json,
+      sourceEvidenceIds:tx.source_evidence_ids
+    }),
+    confidence:1,verificationStatus:'terminal-condition-satisfied',
+    sourceType:'adaptive-research',sourceRef:tx.id
+  });
+
+  await env.DB.prepare(`UPDATE mission_research_questions
+    SET status=CASE WHEN status IN ('open','research_required') THEN 'retained_learning' ELSE status END,last_updated=?
+    WHERE plan_id=? AND status IN ('open','research_required')`).bind(nowISO(),planId).run();
+  await env.DB.prepare(`UPDATE mission_research_branches
+    SET status=CASE WHEN status IN ('queued','executing') THEN 'retained_learning' ELSE status END
+    WHERE objective_id=? AND status IN ('queued','executing')`).bind(objectiveId).run();
+  await env.DB.prepare(`UPDATE mission_research_runs
+    SET status='completed',completed_at=COALESCE(completed_at,?),diagnostic=?
+    WHERE id=?`).bind(nowISO(),`Mission terminal condition satisfied by qualified transaction ${tx.id}. Residual unanswered research retained as non-blocking Hive learning.`,researchRun.runId).run();
+  await env.DB.prepare(`UPDATE mission_research_plans SET status='completed',last_updated=? WHERE id=?`).bind(nowISO(),planId).run();
+  await env.DB.prepare(`UPDATE work_orders SET status='completed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),workOrderId).run();
+  await env.DB.prepare(`UPDATE operational_objectives SET status='completed',completed_at=?,last_updated=? WHERE id=?`).bind(nowISO(),nowISO(),objectiveId).run();
+
+  await audit(env,'ADAPTIVE_RESEARCH','MISSION_TERMINAL_CONDITION_SATISFIED',objectiveId,JSON.stringify({
+    objectiveId,ventureId,planId,runId:researchRun.runId,transactionExtractionId:tx.id,
+    identityStatus:tx.identity_status,missionFitStatus:tx.mission_fit_status,
+    canonicalSourceUrl:tx.canonical_source_url,transactionFingerprint:tx.transaction_fingerprint,
+    completionKnowledgeId,residualResearchDisposition:'retained_learning',externalSpendUSD:0
+  }));
+  return {completed:true,transaction:tx,completionKnowledgeId};
+}
+
 async function ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,ventureId}){
   const state=await getResearchDependencyState(env,planId);
   const qualifiedTransaction=await latestQualifiedTransaction(env,planId);
@@ -5879,6 +5923,18 @@ async function processOperationalObjective(env, objectiveId) {
       await env.DB.prepare(`UPDATE work_orders SET status='research_paused',last_updated=? WHERE id=?`).bind(nowISO(),wo).run();
       await audit(env,'ADAPTIVE_RESEARCH','PROVIDER_CHECKPOINT',wo,JSON.stringify({objectiveId:row.id,researchRun,externalSpendUSD:0}));
       return {ok:true,objectiveId:row.id,workOrderId:wo,status:'research_paused',researchRun,founderActionRequired:false,externalSpendUSD:0};
+    }
+    const missionCompletion=await propagateMissionCompletion(env,{
+      planId:researchPlan.id,objectiveId:row.id,workOrderId:wo,ventureId,researchRun
+    });
+    if(missionCompletion.completed){
+      return {ok:true,objectiveId:row.id,workOrderId:wo,status:'completed',missionCompleted:true,
+        terminalCondition:'qualified-transaction-matched',
+        transactionExtractionId:missionCompletion.transaction.id,
+        identityStatus:missionCompletion.transaction.identity_status,
+        missionFitStatus:missionCompletion.transaction.mission_fit_status,
+        completionKnowledgeId:missionCompletion.completionKnowledgeId,
+        founderActionRequired:false,externalSpendUSD:0};
     }
     if(!researchRun.evidenceSufficient){
       await env.DB.prepare(`UPDATE operational_objectives SET status='research_required',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
