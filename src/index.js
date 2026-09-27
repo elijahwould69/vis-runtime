@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.2-adaptive-research",
+  version: "1.8.3-external-research-fabric",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -783,6 +783,24 @@ async function ensureSchema(env) {
     `CREATE TABLE IF NOT EXISTS research_source_registry (
       id TEXT PRIMARY KEY, source_class TEXT NOT NULL, name TEXT NOT NULL, base_url TEXT,
       scope TEXT, reliability_note TEXT, status TEXT DEFAULT 'active', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS mission_research_runs (
+      id TEXT PRIMARY KEY, plan_id TEXT NOT NULL, objective_id TEXT NOT NULL, venture_id TEXT NOT NULL,
+      status TEXT DEFAULT 'running', questions_attempted INTEGER DEFAULT 0, questions_answered INTEGER DEFAULT 0,
+      evidence_count INTEGER DEFAULT 0, branches_created INTEGER DEFAULT 0, started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      completed_at TEXT, diagnostic TEXT
+    )`,
+    `CREATE TABLE IF NOT EXISTS mission_research_evidence (
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, plan_id TEXT NOT NULL, question_id TEXT NOT NULL,
+      objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, source_id TEXT, source_class TEXT, source_name TEXT,
+      source_url TEXT NOT NULL, title TEXT, evidence_text TEXT NOT NULL, relevance REAL DEFAULT 0,
+      source_quality REAL DEFAULT 0, verification_status TEXT DEFAULT 'retrieved-public-source',
+      fingerprint TEXT, retrieved_at TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS mission_research_branches (
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, parent_question_id TEXT NOT NULL, objective_id TEXT NOT NULL,
+      venture_id TEXT NOT NULL, question TEXT NOT NULL, rationale TEXT, priority INTEGER DEFAULT 3,
+      status TEXT DEFAULT 'queued', created_at TEXT DEFAULT CURRENT_TIMESTAMP
     )`
   ];
 
@@ -4506,8 +4524,121 @@ async function createMissionResearchPlan(env,{objectiveId,ventureId,objective}) 
   ]};
   const id=`MRP-${crypto.randomUUID()}`;
   await env.DB.prepare(`INSERT INTO mission_research_plans (id,objective_id,venture_id,research_goal,plan_json,status,last_updated) VALUES (?,?,?,?,?,'active',?)`).bind(id,objectiveId,ventureId,cleanText(parsed.research_goal,2000),JSON.stringify(parsed),nowISO()).run();
-  for(const q of parsed.questions.slice(0,8)) await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,?,'open',?)`).bind(`MRQ-${crypto.randomUUID()}`,id,objectiveId,ventureId,cleanText(q.question,1200),JSON.stringify(q.source_classes||[]),Math.max(1,Math.min(5,Number(q.priority||3))),nowISO()).run();
+  for(const q of parsed.questions.slice(0,8)) await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,?,'open',?)`).bind(`MRQ-${crypto.randomUUID()}`,id,objectiveId,ventureId,cleanText(q.question,1200),JSON.stringify(q.source_classes||[]),Math.max(1,Math.min(5,typeof q.priority==='string'?({low:2,medium:3,high:5,critical:5}[q.priority.toLowerCase()]||3):Number(q.priority||3))),nowISO()).run();
   return {id,plan:parsed};
+}
+
+
+const RESEARCH_SPECIALIST_SYSTEM=`
+You are a VIS Research Source Specialist. Answer one mission research question using ONLY the supplied retrieved public-source material.
+Separate verified observations from inference. Do not invent facts. If the material does not answer the question, say INSUFFICIENT.
+Return ONLY JSON with keys: answer, confidence, evidence_indexes, gaps, follow_up_questions.
+confidence is 0-1. evidence_indexes is an array of zero-based indexes into SOURCE MATERIAL. follow_up_questions is 0-2 narrowly targeted questions justified by the evidence gap.
+`;
+
+async function researchFingerprint(value){
+  const bytes=new TextEncoder().encode(String(value||''));
+  const digest=await crypto.subtle.digest('SHA-256',bytes);
+  return [...new Uint8Array(digest)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+
+function researchPriority(v){
+  if(typeof v==='string') return ({low:2,medium:3,high:5,critical:5}[v.toLowerCase()]||3);
+  return Math.max(1,Math.min(5,Number(v||3)));
+}
+
+function stripHTMLResearch(html){
+  return cleanText(String(html||'').replace(/<script[\s\S]*?<\/script>/gi,' ').replace(/<style[\s\S]*?<\/style>/gi,' ').replace(/<[^>]+>/g,' ').replace(/&nbsp;/g,' ').replace(/&amp;/g,'&').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/\s+/g,' '),12000);
+}
+
+async function fetchResearchDocument(url){
+  try{
+    const r=await fetch(url,{headers:{'User-Agent':'VIS-Research/1.8.3 (+internal business research; zero-dollar)'}});
+    if(!r.ok) return null;
+    const ct=r.headers.get('content-type')||'';
+    const body=await r.text();
+    return {url,title:url,text:ct.includes('html')?stripHTMLResearch(body):cleanText(body,12000)};
+  }catch(_){ return null; }
+}
+
+function keywordsForResearch(q){
+  const stop=new Set('what are the current key most potential how can does do for and with from into this that company dcc its these their where which who why when revenue increase opportunities industry industries market markets'.split(' '));
+  return String(q||'').toLowerCase().replace(/[^a-z0-9\s-]/g,' ').split(/\s+/).filter(x=>x.length>3&&!stop.has(x)).slice(0,7);
+}
+
+async function collectQuestionSources(env,qrow){
+  let classes=[]; try{ classes=JSON.parse(qrow.source_classes||'[]'); }catch(_){}
+  const words=keywordsForResearch(qrow.question);
+  const docs=[];
+  const add=async(sourceId,sourceClass,name,url,quality)=>{ const d=await fetchResearchDocument(url); if(d&&d.text&&d.text.length>120) docs.push({...d,sourceId,sourceClass,name,quality}); };
+  if(classes.some(x=>['procurement','municipal-procurement','customer-demand','competitor-pricing','industry-market'].includes(x))){
+    const term=encodeURIComponent(words.join(' ')||'construction maintenance');
+    await add('SRC-CANADABUYS','procurement','CanadaBuys',`https://canadabuys.canada.ca/en/tender-opportunities?current_tab=c&items_per_page=50&words=${term}`,1.0);
+  }
+  const statcanMap={
+    'official-statistics':'https://www150.statcan.gc.ca/n1/rss/dai-quo/34-eng.atom',
+    'labour':'https://www150.statcan.gc.ca/n1/rss/dai-quo/14-eng.atom',
+    'trade-market':'https://www150.statcan.gc.ca/n1/rss/dai-quo/12-eng.atom',
+    'industry-market':'https://www150.statcan.gc.ca/n1/rss/dai-quo/33-eng.atom',
+    'technology-signal':'https://www150.statcan.gc.ca/n1/rss/dai-quo/27-eng.atom'
+  };
+  for(const c of [...new Set(classes)]) if(statcanMap[c]) await add(`SRC-STATCAN-${c}`,c,'Statistics Canada',statcanMap[c],1.0);
+  if(classes.includes('regulatory')) await add('SRC-BC-GOV','regulatory','Government of British Columbia','https://www2.gov.bc.ca/gov/content/industry/construction-industry',.95);
+  if(classes.includes('official-statistics')) await add('SRC-BCSTATS','official-statistics','BC Stats','https://www2.gov.bc.ca/gov/content/data/statistics',1.0);
+  return docs.slice(0,6);
+}
+
+async function persistResearchEvidence(env,{runId,planId,qrow,doc,text,relevance=.8}){
+  const fp=await researchFingerprint(`${doc.url}|${text.slice(0,1500)}`);
+  const prior=await env.DB.prepare(`SELECT id FROM mission_research_evidence WHERE fingerprint=? AND objective_id=? LIMIT 1`).bind(fp,qrow.objective_id).first();
+  if(prior) return prior.id;
+  const id=`MRE-${crypto.randomUUID()}`;
+  await env.DB.prepare(`INSERT INTO mission_research_evidence (id,run_id,plan_id,question_id,objective_id,venture_id,source_id,source_class,source_name,source_url,title,evidence_text,relevance,source_quality,verification_status,fingerprint,retrieved_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(id,runId,planId,qrow.id,qrow.objective_id,qrow.venture_id,doc.sourceId,doc.sourceClass,doc.name,doc.url,cleanText(doc.title,500),cleanText(text,5000),relevance,doc.quality,'retrieved-public-source',fp,nowISO()).run();
+  return id;
+}
+
+async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuestions=8}){
+  const runId=`MRUN-${crypto.randomUUID()}`;
+  await env.DB.prepare(`INSERT INTO mission_research_runs (id,plan_id,objective_id,venture_id,status) VALUES (?,?,?,?, 'running')`).bind(runId,planId,objectiveId,ventureId).run();
+  const rows=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status='open' ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,maxQuestions).all()).results||[];
+  let answered=0,evidenceCount=0,branches=0;
+  for(const qrow of rows){
+    const docs=await collectQuestionSources(env,qrow);
+    if(!docs.length){ await env.DB.prepare(`UPDATE mission_research_questions SET status='research_required',answer_summary=?,last_updated=? WHERE id=?`).bind('No configured public source returned usable material.',nowISO(),qrow.id).run(); continue; }
+    let parsed=null;
+    try{
+      const material=docs.map((d,i)=>`[${i}] ${d.name} | ${d.url}\n${d.text.slice(0,5000)}`).join('\n\n');
+      const raw=await think(env,RESEARCH_SPECIALIST_SYSTEM,`QUESTION: ${qrow.question}\nSOURCE MATERIAL:\n${material}`,1400,.15);
+      const m=String(raw||'').match(/\{[\s\S]*\}/); if(m) parsed=JSON.parse(m[0]);
+    }catch(_){}
+    if(!parsed) parsed={answer:'INSUFFICIENT: source specialist could not produce a validated answer.',confidence:0,evidence_indexes:[],gaps:['specialist-output-failure'],follow_up_questions:[]};
+    const refs=[];
+    for(const idx of (Array.isArray(parsed.evidence_indexes)?parsed.evidence_indexes:[]).slice(0,4)){
+      const doc=docs[Number(idx)]; if(!doc) continue;
+      refs.push(await persistResearchEvidence(env,{runId,planId,qrow,doc,text:doc.text,relevance:Number(parsed.confidence||.5)})); evidenceCount++;
+    }
+    const conf=Math.max(0,Math.min(1,Number(parsed.confidence||0)));
+    const status=conf>=.55&&refs.length?'answered':'research_required';
+    if(status==='answered') answered++;
+    await env.DB.prepare(`UPDATE mission_research_questions SET status=?,answer_summary=?,evidence_refs=?,last_updated=? WHERE id=?`).bind(status,cleanText(parsed.answer,5000),JSON.stringify(refs),nowISO(),qrow.id).run();
+    for(const fq of (Array.isArray(parsed.follow_up_questions)?parsed.follow_up_questions:[]).slice(0,2)){
+      if(!fq||String(fq).length<15) continue;
+      await env.DB.prepare(`INSERT INTO mission_research_branches (id,run_id,parent_question_id,objective_id,venture_id,question,rationale,priority,status) VALUES (?,?,?,?,?,?,?,?, 'queued')`).bind(`MRB-${crypto.randomUUID()}`,runId,qrow.id,objectiveId,ventureId,cleanText(fq,1200),`Generated from unresolved evidence gap in ${qrow.id}`,Math.max(1,researchPriority(qrow.priority)-1)).run(); branches++;
+    }
+  }
+  const status=answered? 'completed':'research_required';
+  await env.DB.prepare(`UPDATE mission_research_runs SET status=?,questions_attempted=?,questions_answered=?,evidence_count=?,branches_created=?,completed_at=?,diagnostic=? WHERE id=?`).bind(status,rows.length,answered,evidenceCount,branches,nowISO(),answered?`Answered ${answered}/${rows.length} questions with persisted public-source evidence.`:'No research question reached evidence sufficiency.',runId).run();
+  await env.DB.prepare(`UPDATE mission_research_plans SET status=?,last_updated=? WHERE id=?`).bind(status,nowISO(),planId).run();
+  return {runId,status,questionsAttempted:rows.length,questionsAnswered:answered,evidenceCount,branchesCreated:branches};
+}
+
+async function getMissionResearchEvidence(env,objectiveId){
+  await ensureSchema(env);
+  const run=await env.DB.prepare(`SELECT * FROM mission_research_runs WHERE objective_id=? ORDER BY started_at DESC LIMIT 1`).bind(objectiveId).first();
+  const questions=(await env.DB.prepare(`SELECT id,question,source_classes,priority,status,answer_summary,evidence_refs FROM mission_research_questions WHERE objective_id=? ORDER BY COALESCE(priority,3) DESC,created_at`).bind(objectiveId).all()).results||[];
+  const evidence=(await env.DB.prepare(`SELECT id,question_id,source_class,source_name,source_url,title,relevance,source_quality,verification_status,retrieved_at FROM mission_research_evidence WHERE objective_id=? ORDER BY created_at`).bind(objectiveId).all()).results||[];
+  const branches=(await env.DB.prepare(`SELECT * FROM mission_research_branches WHERE objective_id=? ORDER BY priority DESC,created_at`).bind(objectiveId).all()).results||[];
+  return {ok:true,run,questions,evidence,branches};
 }
 
 const EVIDENCE_CURATOR_SYSTEM=`
@@ -4583,9 +4714,12 @@ async function processOperationalObjective(env, objectiveId) {
     const seedObjective=await createHiveKnowledge(env,{knowledgeType:'founder-objective',subject:`Operational objective ${row.id}`,content:row.objective,confidence:1,verificationStatus:'founder-supplied',sourceType:'founder-intake',sourceRef:row.id});
     const seedPolicy=await createHiveKnowledge(env,{knowledgeType:'operating-policy',subject:'DCC operational authority boundary',content:'VIS may perform internal zero-dollar research, analysis, synthesis, worker coordination, recovery, and documentation. It may not contact prospects, submit bids, spend money, publish publicly, create consequential accounts, enter agreements, make payments, or make legal/compliance representations without explicit Founder approval. Unknown current facts must remain unknown until supported by evidence.',confidence:1,verificationStatus:'operating-policy',sourceType:'hive-policy',sourceRef:'V1.8.1'});
     const researchPlan=await createMissionResearchPlan(env,{objectiveId:row.id,ventureId,objective:row.objective});
+    const researchRun=await executeMissionResearch(env,{planId:researchPlan.id,objectiveId:row.id,ventureId,maxQuestions:8});
+    const directResearch=(await env.DB.prepare(`SELECT question_id,source_name,source_url,title,evidence_text,relevance,source_quality,verification_status,retrieved_at FROM mission_research_evidence WHERE objective_id=? ORDER BY created_at LIMIT 30`).bind(row.id).all()).results||[];
     const recentEvidence=await env.DB.prepare(`SELECT source_name,item_url,title,evidence_text,verification_status,retrieved_at FROM evidence ORDER BY id DESC LIMIT 40`).all();
     const curatedEvidence=await curateMissionEvidence(env,{objective:row.objective,ventureId,researchPlan:researchPlan.plan,candidates:recentEvidence.results||[]});
-    const seedResearch=await createHiveKnowledge(env,{knowledgeType:'mission-directed-evidence',subject:`Curated evidence for ${ventureId} / ${row.id}`,content:JSON.stringify({ventureId,researchPlanId:researchPlan.id,researchPlan:researchPlan.plan,curatedEvidence,evidenceGap:curatedEvidence.length===0?'No current sensor evidence passed mission relevance gating. Research questions remain open; do not substitute unrelated signals.':null}),confidence:curatedEvidence.length?.75:.4,verificationStatus:'mission-curated',sourceType:'adaptive-research',sourceRef:researchPlan.id});
+    const researchAnswers=(await env.DB.prepare(`SELECT id,question,priority,status,answer_summary,evidence_refs FROM mission_research_questions WHERE plan_id=? ORDER BY COALESCE(priority,3) DESC,created_at`).bind(researchPlan.id).all()).results||[];
+    const seedResearch=await createHiveKnowledge(env,{knowledgeType:'mission-directed-evidence',subject:`Curated evidence for ${ventureId} / ${row.id}`,content:JSON.stringify({ventureId,researchPlanId:researchPlan.id,researchPlan:researchPlan.plan,researchRun,researchAnswers,directResearch,curatedSensorEvidence:curatedEvidence,evidenceGap:directResearch.length===0&&curatedEvidence.length===0?'No mission-aligned public-source evidence was retrieved. Preserve the gap and continue internal research; do not substitute unrelated signals.':null}),confidence:directResearch.length?.9:(curatedEvidence.length?.7:.35),verificationStatus:'mission-curated',sourceType:'external-research-fabric',sourceRef:researchRun.runId});
     const seeds=[seedObjective,seedPolicy,seedResearch];
     const planning=await aiPrimaryManagerPlan(env,{workOrderId:wo,objective:row.objective,knowledgeIds:seeds,authorityScope:row.authority_scope});
     const assignments=[];
@@ -4851,6 +4985,11 @@ export default {
         if (url.pathname === "/admin/ventures" && request.method === "GET") {
           await ensureSchema(env);
           return json({ok:true,ventures:(await env.DB.prepare(`SELECT * FROM ventures ORDER BY created_at`).all()).results||[]});
+        }
+
+        if (url.pathname.startsWith("/admin/research-evidence/") && request.method === "GET") {
+          const oid=decodeURIComponent(url.pathname.slice("/admin/research-evidence/".length));
+          return json(await getMissionResearchEvidence(env,oid));
         }
 
         if (url.pathname.startsWith("/admin/research-plan/") && request.method === "GET") {
