@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.16-transaction-first-discovery",
+  version: "1.8.17-transaction-discovery-stage",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -4982,6 +4982,9 @@ async function collectQuestionSources(env,qrow,budget){
   // hypotheses from real purchasing signals. This is deliberately broad but
   // bounded: five lanes maximum and the normal 20-fetch ceiling still applies.
   if(isTransactionFirstBuyerQuestion(qrow)){
+    // BC-specific observable purchasing source. The public Digital Marketplace
+    // exposes named provincial opportunities/awards and transaction values.
+    await add('SRC-BC-DIGITAL-MARKETPLACE-TXN','procurement','B.C. Digital Marketplace — transaction scan','https://marketplace.digital.gov.bc.ca/',1.0);
     const lanes=[
       ['maintenance repair services','MAINTENANCE'],
       ['inspection testing services','INSPECTION'],
@@ -5114,6 +5117,7 @@ const RESEARCH_DEPENDENCY_PREREQS={
 
 function canonicalDependencyDimension(question=''){
   const q=String(question||'').toLowerCase();
+  if(q.includes('which current british columbia public-sector purchasing transaction')) return 'buyer';
   if(q.includes('which specific british columbia buyer organization or narrowly defined buyer class')) return 'buyer';
   if(q.includes('what current primary evidence shows a costly, urgent, recurring problem for that specific buyer')) return 'pain';
   if(q.includes('what concrete product or service could vis-backed operators deliver to solve that evidenced buyer problem')) return 'offer';
@@ -5127,15 +5131,23 @@ function canonicalDependencyDimension(question=''){
 
 async function getResearchDependencyState(env,planId){
   const roots=(await env.DB.prepare(`SELECT id,question,status,evidence_refs,answer_summary FROM mission_research_questions WHERE plan_id=? ORDER BY created_at,id`).bind(planId).all()).results||[];
-  const canonical={};
-  for(const r of roots){ const d=canonicalDependencyDimension(r.question); if(d&&!canonical[d]) canonical[d]=r; }
+  const canonical={}, candidates={};
+  for(const r of roots){
+    const d=canonicalDependencyDimension(r.question);
+    if(!d) continue;
+    if(!canonical[d]) canonical[d]=r;
+    if(!candidates[d]) candidates[d]=[];
+    candidates[d].push(r);
+  }
   const ready={};
   for(const d of RESEARCH_DEPENDENCY_ORDER){
-    const r=canonical[d];
-    let ok=Boolean(r&&r.status==='answered'&&r.evidence_refs&&r.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(r.answer_summary||'')));
-    if(!ok&&r){
-      const child=await env.DB.prepare(`SELECT q.id FROM mission_research_branches b JOIN mission_research_questions q ON q.id=b.child_question_id WHERE b.parent_question_id=? AND q.status='answered' AND q.evidence_refs IS NOT NULL AND q.evidence_refs!='[]' AND COALESCE(q.answer_summary,'') NOT LIKE 'INSUFFICIENT%' ORDER BY q.last_updated DESC LIMIT 1`).bind(r.id).first();
-      ok=Boolean(child?.id);
+    const rows=candidates[d]||[];
+    let ok=rows.some(r=>r.status==='answered'&&r.evidence_refs&&r.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(r.answer_summary||'')));
+    if(!ok){
+      for(const r of rows){
+        const child=await env.DB.prepare(`SELECT q.id FROM mission_research_branches b JOIN mission_research_questions q ON q.id=b.child_question_id WHERE b.parent_question_id=? AND q.status='answered' AND q.evidence_refs IS NOT NULL AND q.evidence_refs!='[]' AND COALESCE(q.answer_summary,'') NOT LIKE 'INSUFFICIENT%' ORDER BY q.last_updated DESC LIMIT 1`).bind(r.id).first();
+        if(child?.id){ ok=true; break; }
+      }
     }
     ready[d]=ok;
   }
@@ -5148,6 +5160,27 @@ async function researchDependencyGate(env,planId,qrow){
   const prereqs=RESEARCH_DEPENDENCY_PREREQS[dim]||[];
   const missing=prereqs.filter(d=>!state.ready[d]);
   return {allowed:missing.length===0,dimension:dim,missing,state};
+}
+
+async function ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,ventureId}){
+  const state=await getResearchDependencyState(env,planId);
+  if(state.ready.buyer) return {buyerReady:true,question:null,created:false};
+  const marker='Which current British Columbia public-sector purchasing transaction';
+  let row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND question LIKE ? ORDER BY created_at DESC LIMIT 1`).bind(planId,`${marker}%`).first();
+  if(!row){
+    const id=`MRQ-${crypto.randomUUID()}`;
+    const question=`Which current British Columbia public-sector purchasing transaction provides direct evidence of a named buyer organization, a concrete purchased scope, and an observable procurement mechanism? Search actual tenders, awards, purchase opportunities, or public contract records across multiple service and supply categories. Do not search for ${objectiveId} as a product, category, code, or budget item.`;
+    await env.DB.prepare(`INSERT INTO mission_research_questions (id,plan_id,objective_id,venture_id,question,source_classes,priority,status,last_updated) VALUES (?,?,?,?,?,?,5,'open',?)`).bind(id,planId,objectiveId,ventureId,question,JSON.stringify(['procurement','municipal-procurement','customer-demand']),nowISO()).run();
+    row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(id).first();
+    await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_CREATED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:id,controlVersion:'1.8.17',legacyQueueBypassed:true,externalSpendUSD:0}));
+    return {buyerReady:false,question:row,created:true};
+  }
+  if(row.status==='answered'&&row.evidence_refs&&row.evidence_refs!=='[]'&&!/^INSUFFICIENT/i.test(String(row.answer_summary||''))) return {buyerReady:true,question:row,created:false};
+  if(!['open','research_required'].includes(row.status)){
+    await env.DB.prepare(`UPDATE mission_research_questions SET status='open',last_updated=? WHERE id=?`).bind(nowISO(),row.id).run();
+    row=await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE id=?`).bind(row.id).first();
+  }
+  return {buyerReady:false,question:row,created:false};
 }
 
 async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuestions=8,maxDepth=2,maxTotalQuestions=16,maxSourceFetches=20}){
@@ -5232,8 +5265,25 @@ async function executeMissionResearch(env,{planId,objectiveId,ventureId,maxQuest
       await env.DB.prepare(`UPDATE mission_research_branches SET status='completed',completed_at=? WHERE id=?`).bind(nowISO(),bid).run();
     }
   };
-  const roots=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status IN ('open','research_required') ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,maxQuestions).all()).results||[];
-  for(const q of roots){ if(providerState||attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) break; await processRow(q,0); }
+  // V1.8.17 control layer: unresolved Buyer enters a dedicated transaction-discovery
+  // stage. The legacy queue is bypassed completely until direct transaction evidence
+  // establishes a buyer. This prevents abstract OEC/category/budget questions from
+  // consuming the remaining research budget.
+  const discoveryStage=await ensureTransactionDiscoveryStageQuestion(env,{planId,objectiveId,ventureId});
+  if(!discoveryStage.buyerReady){
+    if(discoveryStage.question) await processRow(discoveryStage.question,0);
+    const postDiscovery=await getResearchDependencyState(env,planId);
+    if(!postDiscovery.ready.buyer){
+      await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_STAGE_HELD',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:discoveryStage.question?.id||null,buyerReady:false,legacyQueueBypassed:true,sourceFetchesUsed:budget.fetches,externalSpendUSD:0}));
+    } else {
+      await audit(env,'ADAPTIVE_RESEARCH','TRANSACTION_DISCOVERY_BUYER_ESTABLISHED',objectiveId,JSON.stringify({objectiveId,ventureId,planId,questionId:discoveryStage.question?.id||null,buyerReady:true,externalSpendUSD:0}));
+      const roots=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status IN ('open','research_required') AND id<>? ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,discoveryStage.question?.id||'',maxQuestions).all()).results||[];
+      for(const q of roots){ if(providerState||attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) break; await processRow(q,0); }
+    }
+  } else {
+    const roots=(await env.DB.prepare(`SELECT * FROM mission_research_questions WHERE plan_id=? AND status IN ('open','research_required') ORDER BY COALESCE(priority,3) DESC,created_at LIMIT ?`).bind(planId,maxQuestions).all()).results||[];
+    for(const q of roots){ if(providerState||attempted>=maxTotalQuestions||budget.fetches>=budget.maxFetches) break; await processRow(q,0); }
+  }
   const unresolvedRow=await env.DB.prepare(`SELECT COUNT(*) AS n FROM mission_research_questions WHERE plan_id=? AND status IN ('open','research_required')`).bind(planId).first();
   const queuedBranchRow=await env.DB.prepare(`SELECT COUNT(*) AS n FROM mission_research_branches WHERE objective_id=? AND status='queued'`).bind(objectiveId).first();
   const unresolvedQuestions=Number(unresolvedRow?.n||0), queuedBranches=Number(queuedBranchRow?.n||0);
