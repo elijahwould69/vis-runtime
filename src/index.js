@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.32-failure-health-reconciliation",
+  version: "1.8.33-subsystem-recovery-detection",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -914,6 +914,7 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.30-001','1.8.30','Memory Quality and Consolidation: exclude self-memory, rank by evidence value and recency, penalize redundant objective echoes, diversify memory packets, and preserve provenance and venture boundaries')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.31-001','1.8.31','Memory Score Normalization: normalize lexical overlap to a true zero-to-one range and cap founder-objective echoes so validated Hive knowledge cannot be crowded out by repetitive objective text')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.32-001','1.8.32','Failure Health Reconciliation: preserve forensic failure history, classify unresolved records by current evidence, safely close only proven recovered failures, and expose actionable versus historical health')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.33-001','1.8.33','Subsystem-Aware Recovery Detection: resolve historical failures only when the same execution pathway later demonstrates successful operation; preserve original forensic events and exact recovery provenance')`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS failure_health_assessments (
     failure_id INTEGER PRIMARY KEY,
     classification TEXT NOT NULL,
@@ -3737,10 +3738,139 @@ CONTEXT BOUNDARY: Use only the Atlas memorandum and current rotation evidence pa
    ============================================================ */
 
 
+function failureSubsystem(component='') {
+  const c=String(component||'');
+  if(c==='operational-intake') return 'operational-intake';
+  if(c==='scout-ai') return 'scout-ai';
+  if(c.startsWith('research-specialist:')) return 'research-specialist';
+  return c || 'unknown';
+}
+
+function failureFamily(error='') {
+  const e=String(error||'').toLowerCase();
+  if(e.includes('invalid evidence index')) return 'invalid-evidence-index';
+  if(e.includes('network connection lost')) return 'd1-network-loss';
+  if(e.includes('like or glob pattern too complex')) return 'd1-pattern-complexity';
+  if(e.includes('daily free allocation') || e.includes('too many subrequests')) return 'workers-ai-capacity';
+  return 'other';
+}
+
+async function subsystemRecoveryEvidence(env,failure) {
+  const subsystem=failureSubsystem(failure.component);
+  const family=failureFamily(failure.error);
+
+  if(subsystem==='research-specialist') {
+    const direct=failure.rotation_id
+      ? await env.DB.prepare(`
+          SELECT id,status,completed_at,questions_answered,evidence_count
+          FROM mission_research_runs
+          WHERE id=? AND lower(status)='completed'
+          LIMIT 1
+        `).bind(failure.rotation_id).first()
+      : null;
+    if(direct) return {
+      recoveryType:'direct-research-run-completed',
+      subsystem,family,
+      recordId:direct.id,status:direct.status,completedAt:direct.completed_at||null,
+      questionsAnswered:Number(direct.questions_answered||0),
+      evidenceCount:Number(direct.evidence_count||0)
+    };
+
+    const later=await env.DB.prepare(`
+      SELECT id,status,completed_at,questions_answered,evidence_count
+      FROM mission_research_runs
+      WHERE lower(status)='completed'
+        AND completed_at IS NOT NULL
+        AND datetime(completed_at) > datetime(?)
+        AND (questions_answered > 0 OR evidence_count > 0)
+      ORDER BY datetime(completed_at) DESC
+      LIMIT 1
+    `).bind(failure.created_at).first();
+    if(later) return {
+      recoveryType:'later-research-subsystem-success',
+      subsystem,family,
+      recordId:later.id,status:later.status,completedAt:later.completed_at,
+      questionsAnswered:Number(later.questions_answered||0),
+      evidenceCount:Number(later.evidence_count||0)
+    };
+  }
+
+  if(subsystem==='operational-intake') {
+    const direct=failure.rotation_id
+      ? await env.DB.prepare(`
+          SELECT id,work_order_id,status,lifecycle_state,completed_at,last_updated
+          FROM operational_objectives
+          WHERE (work_order_id=? OR id=?)
+            AND lower(status)='completed'
+            AND lower(COALESCE(lifecycle_state,'completed'))='completed'
+          LIMIT 1
+        `).bind(failure.rotation_id,failure.rotation_id).first()
+      : null;
+    if(direct) return {
+      recoveryType:'direct-objective-completed',
+      subsystem,family,
+      recordId:direct.id,workOrderId:direct.work_order_id||null,
+      status:direct.status,lifecycleState:direct.lifecycle_state||null,
+      completedAt:direct.completed_at||direct.last_updated||null
+    };
+
+    const later=await env.DB.prepare(`
+      SELECT id,work_order_id,status,lifecycle_state,completed_at,last_updated
+      FROM operational_objectives
+      WHERE lower(status)='completed'
+        AND lower(COALESCE(lifecycle_state,'completed'))='completed'
+        AND datetime(COALESCE(completed_at,last_updated)) > datetime(?)
+      ORDER BY datetime(COALESCE(completed_at,last_updated)) DESC
+      LIMIT 1
+    `).bind(failure.created_at).first();
+    if(later) return {
+      recoveryType:'later-operational-intake-success',
+      subsystem,family,
+      recordId:later.id,workOrderId:later.work_order_id||null,
+      status:later.status,lifecycleState:later.lifecycle_state||null,
+      completedAt:later.completed_at||later.last_updated||null
+    };
+  }
+
+  if(subsystem==='scout-ai') {
+    const later=await env.DB.prepare(`
+      SELECT id,agent_id,status,completed_at,summary
+      FROM rotations
+      WHERE agent_id='ATLAS'
+        AND lower(status)='completed'
+        AND completed_at IS NOT NULL
+        AND datetime(completed_at) > datetime(?)
+      ORDER BY datetime(completed_at) DESC
+      LIMIT 1
+    `).bind(failure.created_at).first();
+    if(later) return {
+      recoveryType:'later-scout-pipeline-success',
+      subsystem,family,
+      recordId:later.id,agentId:later.agent_id,status:later.status,
+      completedAt:later.completed_at
+    };
+  }
+
+  return null;
+}
+
 async function assessFailureHealth(env, failure) {
   const rotation = failure.rotation_id
     ? await env.DB.prepare(`SELECT id,status,completed_at,summary FROM rotations WHERE id=? LIMIT 1`).bind(failure.rotation_id).first()
     : null;
+
+  if (rotation && String(rotation.status||'').toLowerCase()==='completed') {
+    return {
+      classification:'historical-recovered',
+      reason:'The exact linked rotation subsequently completed.',
+      evidence:{
+        recoveryScope:'exact-record',
+        subsystem:failureSubsystem(failure.component),
+        family:failureFamily(failure.error),
+        rotationId:rotation.id,rotationStatus:rotation.status,completedAt:rotation.completed_at||null
+      }
+    };
+  }
 
   const laterHealthy = await env.DB.prepare(`
     SELECT id,status,details,created_at
@@ -3752,28 +3882,40 @@ async function assessFailureHealth(env, failure) {
     LIMIT 1
   `).bind(failure.component,failure.created_at).first();
 
-  if (rotation && String(rotation.status||'').toLowerCase()==='completed') {
-    return {
-      classification:'historical-recovered',
-      reason:'The failure is tied to a rotation that subsequently completed.',
-      evidence:{rotationId:rotation.id,rotationStatus:rotation.status,completedAt:rotation.completed_at||null}
-    };
-  }
-
   if (laterHealthy) {
     return {
       classification:'historical-recovered',
-      reason:'A later healthy runtime-health record exists for the same component.',
-      evidence:{healthId:laterHealthy.id,status:laterHealthy.status,createdAt:laterHealthy.created_at}
+      reason:'A later healthy runtime-health record exists for the exact component.',
+      evidence:{
+        recoveryScope:'exact-component',
+        subsystem:failureSubsystem(failure.component),
+        family:failureFamily(failure.error),
+        healthId:laterHealthy.id,status:laterHealthy.status,createdAt:laterHealthy.created_at
+      }
+    };
+  }
+
+  const subsystemRecovery=await subsystemRecoveryEvidence(env,failure);
+  if(subsystemRecovery) {
+    return {
+      classification:'historical-recovered',
+      reason:'The same execution subsystem demonstrated successful operation after this failure.',
+      evidence:{recoveryScope:'subsystem',...subsystemRecovery}
     };
   }
 
   return {
     classification:'actionable-unresolved',
     reason: rotation
-      ? `No recovery evidence found; linked rotation status is ${String(rotation.status||'unknown')}.`
-      : 'No later recovery evidence or completed linked rotation was found.',
-    evidence:{rotationId:failure.rotation_id||null,rotationStatus:rotation?.status||null}
+      ? `No exact-component or subsystem recovery evidence found; linked rotation status is ${String(rotation.status||'unknown')}.`
+      : 'No exact-component or subsystem recovery evidence was found.',
+    evidence:{
+      recoveryScope:'none',
+      subsystem:failureSubsystem(failure.component),
+      family:failureFamily(failure.error),
+      rotationId:failure.rotation_id||null,
+      rotationStatus:rotation?.status||null
+    }
   };
 }
 
