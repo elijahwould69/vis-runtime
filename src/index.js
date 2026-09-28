@@ -1,5 +1,5 @@
 const VIS = {
-  version: "1.8.31-memory-score-normalization",
+  version: "1.8.32-failure-health-reconciliation",
   model: "@cf/meta/llama-3.1-8b-instruct-fast",
 
   paidSpendingEnabled: false,
@@ -913,6 +913,14 @@ async function ensureSchema(env) {
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.29-001','1.8.29','Institutional Learning Retrieval and Reuse: new missions retrieve relevant active Hive knowledge with provenance, venture-boundary classification, and bounded reuse packets before research planning')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.30-001','1.8.30','Memory Quality and Consolidation: exclude self-memory, rank by evidence value and recency, penalize redundant objective echoes, diversify memory packets, and preserve provenance and venture boundaries')`).run();
   await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.31-001','1.8.31','Memory Score Normalization: normalize lexical overlap to a true zero-to-one range and cap founder-objective echoes so validated Hive knowledge cannot be crowded out by repetitive objective text')`).run();
+  await env.DB.prepare(`INSERT OR IGNORE INTO schema_migrations (id,version,description) VALUES ('MIG-1.8.32-001','1.8.32','Failure Health Reconciliation: preserve forensic failure history, classify unresolved records by current evidence, safely close only proven recovered failures, and expose actionable versus historical health')`).run();
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS failure_health_assessments (
+    failure_id INTEGER PRIMARY KEY,
+    classification TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    evidence_json TEXT,
+    assessed_at TEXT DEFAULT CURRENT_TIMESTAMP
+  )`).run();
   await env.DB.prepare(`CREATE TABLE IF NOT EXISTS mission_knowledge_retrievals (
     id TEXT PRIMARY KEY, objective_id TEXT NOT NULL, venture_id TEXT NOT NULL, knowledge_id TEXT NOT NULL,
     relevance REAL DEFAULT 0, boundary_class TEXT NOT NULL, reuse_disposition TEXT NOT NULL,
@@ -3728,6 +3736,129 @@ CONTEXT BOUNDARY: Use only the Atlas memorandum and current rotation evidence pa
    ADMIN
    ============================================================ */
 
+
+async function assessFailureHealth(env, failure) {
+  const rotation = failure.rotation_id
+    ? await env.DB.prepare(`SELECT id,status,completed_at,summary FROM rotations WHERE id=? LIMIT 1`).bind(failure.rotation_id).first()
+    : null;
+
+  const laterHealthy = await env.DB.prepare(`
+    SELECT id,status,details,created_at
+    FROM runtime_health
+    WHERE component=?
+      AND lower(status) IN ('healthy','ok','online','completed','recovered')
+      AND datetime(created_at) > datetime(?)
+    ORDER BY datetime(created_at) DESC,id DESC
+    LIMIT 1
+  `).bind(failure.component,failure.created_at).first();
+
+  if (rotation && String(rotation.status||'').toLowerCase()==='completed') {
+    return {
+      classification:'historical-recovered',
+      reason:'The failure is tied to a rotation that subsequently completed.',
+      evidence:{rotationId:rotation.id,rotationStatus:rotation.status,completedAt:rotation.completed_at||null}
+    };
+  }
+
+  if (laterHealthy) {
+    return {
+      classification:'historical-recovered',
+      reason:'A later healthy runtime-health record exists for the same component.',
+      evidence:{healthId:laterHealthy.id,status:laterHealthy.status,createdAt:laterHealthy.created_at}
+    };
+  }
+
+  return {
+    classification:'actionable-unresolved',
+    reason: rotation
+      ? `No recovery evidence found; linked rotation status is ${String(rotation.status||'unknown')}.`
+      : 'No later recovery evidence or completed linked rotation was found.',
+    evidence:{rotationId:failure.rotation_id||null,rotationStatus:rotation?.status||null}
+  };
+}
+
+async function reconcileFailureHealth(env,{applySafeResolution=true}={}) {
+  const rows=await env.DB.prepare(`
+    SELECT id,rotation_id,component,error,retry_count,resolved,created_at
+    FROM failures
+    WHERE resolved=0
+    ORDER BY id
+  `).all();
+
+  let safelyResolved=0;
+  let actionable=0;
+  const assessments=[];
+
+  for(const failure of (rows.results||[])) {
+    const assessment=await assessFailureHealth(env,failure);
+    assessments.push({failureId:failure.id,component:failure.component,...assessment});
+
+    await env.DB.prepare(`
+      INSERT INTO failure_health_assessments
+        (failure_id,classification,reason,evidence_json,assessed_at)
+      VALUES (?,?,?,?,CURRENT_TIMESTAMP)
+      ON CONFLICT(failure_id) DO UPDATE SET
+        classification=excluded.classification,
+        reason=excluded.reason,
+        evidence_json=excluded.evidence_json,
+        assessed_at=CURRENT_TIMESTAMP
+    `).bind(failure.id,assessment.classification,assessment.reason,JSON.stringify(assessment.evidence||{})).run();
+
+    if(assessment.classification==='historical-recovered' && applySafeResolution) {
+      await env.DB.prepare(`UPDATE failures SET resolved=1 WHERE id=? AND resolved=0`).bind(failure.id).run();
+      await audit(env,'JANITOR','FAILURE_SAFELY_RECONCILED',String(failure.id),
+        JSON.stringify({component:failure.component,reason:assessment.reason,evidence:assessment.evidence,forensicRecordPreserved:true}));
+      safelyResolved++;
+    } else if(assessment.classification==='actionable-unresolved') {
+      actionable++;
+    }
+  }
+
+  const rawRemaining=await env.DB.prepare(`SELECT COUNT(*) AS count FROM failures WHERE resolved=0`).first();
+  const historicalResolved=await env.DB.prepare(`
+    SELECT COUNT(*) AS count
+    FROM failure_health_assessments
+    WHERE classification='historical-recovered'
+  `).first();
+
+  return {
+    ok:true,
+    version:VIS.version,
+    assessed:(rows.results||[]).length,
+    safelyResolved,
+    actionableUnresolved:actionable,
+    rawUnresolvedAfterReconciliation:Number(rawRemaining?.count||0),
+    historicalRecovered:Number(historicalResolved?.count||0),
+    forensicHistoryPreserved:true,
+    assessments
+  };
+}
+
+async function getFailureHealth(env) {
+  const raw=await env.DB.prepare(`SELECT COUNT(*) AS count FROM failures WHERE resolved=0`).first();
+  const byComponent=await env.DB.prepare(`
+    SELECT component,COUNT(*) AS count,MAX(created_at) AS latest
+    FROM failures
+    WHERE resolved=0
+    GROUP BY component
+    ORDER BY count DESC,component
+  `).all();
+  const assessed=await env.DB.prepare(`
+    SELECT a.failure_id,a.classification,a.reason,a.evidence_json,a.assessed_at,
+           f.rotation_id,f.component,f.error,f.retry_count,f.resolved,f.created_at
+    FROM failure_health_assessments a
+    JOIN failures f ON f.id=a.failure_id
+    ORDER BY a.failure_id
+  `).all();
+  return {
+    ok:true,
+    version:VIS.version,
+    unresolvedFailures:Number(raw?.count||0),
+    unresolvedByComponent:byComponent.results||[],
+    assessments:assessed.results||[]
+  };
+}
+
 async function getLatestFailure(env) {
   const latest =
     await env.DB.prepare(`
@@ -3864,6 +3995,22 @@ async function getStatus(env) {
       Number(
         failures?.count || 0
       ),
+
+    failureHealth:
+      await (async()=>{
+        const historical=await env.DB.prepare(`SELECT COUNT(*) AS count FROM failure_health_assessments WHERE classification='historical-recovered'`).first();
+        const actionable=await env.DB.prepare(`
+          SELECT COUNT(*) AS count
+          FROM failure_health_assessments a
+          JOIN failures f ON f.id=a.failure_id
+          WHERE a.classification='actionable-unresolved' AND f.resolved=0
+        `).first();
+        return {
+          actionableUnresolved:Number(actionable?.count||0),
+          historicalRecovered:Number(historical?.count||0),
+          forensicHistoryPreserved:true
+        };
+      })(),
 
     agents:
       agents.results || [],
@@ -6428,6 +6575,14 @@ export default {
           );
         }
 
+        if (url.pathname === "/admin/failure-health") {
+          await ensureSchema(env);
+          if (request.method === "POST") {
+            return json(await reconcileFailureHealth(env,{applySafeResolution:true}));
+          }
+          return json(await getFailureHealth(env));
+        }
+
         if (
           url.pathname ===
           "/admin/experiment-status"
@@ -6645,6 +6800,7 @@ export default {
     ctx.waitUntil((async()=>{
       await runVIS(env,`cron:${controller.cron}`);
       await continueOperationalQueue(env);
+      await reconcileFailureHealth(env,{applySafeResolution:true});
     })());
   }
 };
